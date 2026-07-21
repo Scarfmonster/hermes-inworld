@@ -624,11 +624,15 @@ class InworldSTTProvider(TranscriptionProvider):
 
             [emotion -> calm:0.85, sad:0.10 | vocalStyle -> normal:0.92]
         """
+        # API may return snake_case keys (voice_profile, vocal_style)
+        # Normalize to camelCase for consistent skip/display handling.
+        _VP_KEY_ALIASES = {"vocal_style": "vocalStyle"}
         skip_keys = self._voice_profile_skip_keys_config()
         min_confidence = self._voice_profile_min_confidence_config()
         parts: list[str] = []
-        for profile_key, entries in voice_profile.items():
-            if profile_key in skip_keys:
+        for raw_key, entries in voice_profile.items():
+            normalized = _VP_KEY_ALIASES.get(raw_key, raw_key)
+            if normalized in skip_keys:
                 continue
             if not isinstance(entries, list) or not entries:
                 continue
@@ -642,7 +646,7 @@ class InworldSTTProvider(TranscriptionProvider):
             if not labels:
                 continue
             label_str = ", ".join(labels)
-            parts.append(f"{profile_key} -> {label_str}")
+            parts.append(f"{normalized} -> {label_str}")
         if parts:
             return "[" + " | ".join(parts) + "]"
         return ""
@@ -998,7 +1002,10 @@ class InworldSTTProvider(TranscriptionProvider):
             transcript = f"{voice_prefix} {transcript}"
 
         if include_voice_profile and transcript:
-            voice_profile = data.get("voiceProfile")
+            transcription_data = data.get("transcription", {})
+            voice_profile = transcription_data.get("voiceProfile") or data.get(
+                "voiceProfile"
+            )
             if voice_profile:
                 suffix = self._format_voice_profile_suffix(voice_profile)
                 if suffix:
