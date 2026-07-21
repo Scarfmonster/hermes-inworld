@@ -1,6 +1,6 @@
 [project]
 name = "hermes-inworld"
-version = "1.0.0"
+version = "1.0.1"
 description = "Hermes Agent plugin providing Inworld TTS-2 (steered speech synthesis) and Realtime STT (transcription with Voice Profile analysis)."
 readme = "README.md"
 requires-python = ">=3.13"

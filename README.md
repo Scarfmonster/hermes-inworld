@@ -71,6 +71,10 @@ stt:
       - age                    # the transcript suffix. Defaults to
       - gender                 # ["age", "gender", "accent"].
       - accent
+    voice_profile_min_confidence: 0.2  # optional; per-label confidence floor
+                                     # (0.0-1.0). Labels below this
+                                     # threshold are dropped from the
+                                     # transcript suffix. Defaults to 0.2.
     prompts:                   # optional custom vocabulary
       - "Hermes"
     timeouts:                  # optional; per-stage timeouts (seconds).

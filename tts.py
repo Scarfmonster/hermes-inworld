@@ -370,6 +370,21 @@ class InworldTTSProvider(TTSProvider):
                     policy[key] = default
         return policy
 
+    def _voice_config(self) -> str:
+        """Return the configured voice ID, or ``default_voice()`` when unset.
+
+        Reads ``tts.inworld-tts.voice`` from Hermes ``config.yaml``. Non-string
+        or whitespace-only values fall back to ``default_voice()`` so a
+        typo like ``voice: 123`` doesn't crash synthesis.
+        """
+        cfg = self._get_provider_config()
+        raw = cfg.get("voice")
+        if isinstance(raw, str):
+            stripped = raw.strip()
+            if stripped:
+                return stripped
+        return self.default_voice()
+
     def _synthesize_with_retries(
         self,
         payload: dict[str, Any],
@@ -472,7 +487,7 @@ class InworldTTSProvider(TTSProvider):
             RuntimeError: On API errors, auth failures, or empty responses.
         """
         key = api_key()
-        voice_id = voice or self.default_voice()
+        voice_id = voice or self._voice_config()
         model_id = model or DEFAULT_MODEL
         delivery_mode = self._delivery_mode_config()
         timeout = self._tts_timeout_config()
