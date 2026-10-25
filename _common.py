@@ -10,9 +10,10 @@ from email.utils import parsedate_to_datetime
 from typing import Any
 
 try:
-    import yaml as _yaml
+    from ruamel.yaml import YAML as _yaml
 except ImportError:
-    _yaml = None  # type: ignore[assignment]  # PyYAML is a declared dependency; this guards import-time robustness
+    print("Failed to import ruamel.yaml; falling back to config-less defaults.")
+    _yaml = None  # type: ignore[assignment]
 
 INWORLD_TTS_API_URL = "https://api.inworld.ai/tts/v1/voice"
 INWORLD_STT_API_URL = "https://api.inworld.ai/stt/v1/transcribe"
@@ -127,7 +128,8 @@ def read_hermes_config() -> dict[str, Any]:
     )
     try:
         with open(config_path) as f:
-            loaded = _yaml.safe_load(f)
+            yaml = _yaml(typ="safe")
+            loaded = yaml.load(f)
     except Exception:
         return {}
     return loaded if isinstance(loaded, dict) else {}
