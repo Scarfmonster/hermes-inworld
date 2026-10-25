@@ -18,10 +18,13 @@ Hermes Agent voice plugin — Inworld TTS-2 / TTS-2 Flash with manual or opt-in 
   runs the TTS input through a hidden auxiliary LLM pass
   (`auxiliary.tts_audio_tags`) to add tags before synthesis. Default `false`:
   text is synthesized as written.
-- Rewrite prompts: `inworld-tts-2` gets the full prompt (instruction tags,
-  non-verbals, emphasis, formatting); `inworld-tts-2-flash` gets the reduced
-  prompt (non-verbals and formatting; no instruction tags or emphasis).
-  Deprecated/unknown model IDs skip the rewrite and log one warning per model.
+- Rewrite prompts are composed from shared sections plus optional capability
+  sections. The steering-enabled prompt adds inline delivery directions with
+  `[reset]` persistence and mixed-language spans; the no-steering prompt uses
+  the shared non-verbals, emphasis, pauses, verbatim IDs, IPA, language
+  prefixes, number/abbreviation normalization, mandatory acronym IPA, cleanup,
+  and formatting sections only. Deprecated/unknown model IDs skip the rewrite
+  and log one warning per model.
 - Choose a voice via `tts.inworld-tts.voice` in config (defaults to "Sarah").
 - Optional speaking rate (`speed`) forwarded by Hermes as
   `audioConfig.speakingRate`.
@@ -151,9 +154,15 @@ Set `tts.inworld-tts.steering_rewrite: true` to have the TTS input rewritten
 by the auxiliary LLM task `tts_audio_tags` before synthesis. The visible chat
 text is unchanged; only the text sent to Inworld is rewritten.
 
-- `inworld-tts-2`: full steering tags, non-verbals, emphasis, and formatting.
-- `inworld-tts-2-flash`: reduced prompt (non-verbals and formatting; no
-  instruction tags or emphasis).
+- Steering-enabled prompt: inline delivery directions (including `[reset]`
+  for direction persistence), non-verbals, emphasis, pause controls,
+  `<verbatim>` IDs, inline IPA (acronyms are always transcribed with their
+  established reading), `<lang>` tags for complete foreign words and phrases,
+  number/abbreviation normalization, and formatting.
+- No-steering prompt: the shared non-verbals, emphasis, pauses, `<verbatim>`
+  IDs, inline IPA (acronyms are always transcribed with their established
+  reading), language prefixes, number/abbreviation normalization, cleanup, and
+  formatting sections only.
 - Deprecated/unknown model IDs: rewrite is skipped, the original text is
   synthesized, and one warning per model is logged.
 

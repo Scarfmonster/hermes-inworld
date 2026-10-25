@@ -1,152 +1,222 @@
 """TTS rewrite prompts for the Inworld TTS provider.
 
 These prompts are sent to the auxiliary LLM (task ``tts_audio_tags``) when
-``tts.inworld-tts.steering_rewrite`` is enabled. They are deliberately
-model-agnostic: each prompt describes the capabilities of the target engine
-and model selection happens in code.
+``tts.inworld-tts.steering_rewrite`` is enabled.
 
-The full rewrite prompt keeps the original section structure and
-composition; the reduced prompt reuses the model-neutral sections and omits
-the steering catalog because the reduced-capability engine ignores
-instruction tags.
+Both prompts are assembled from the same shared sections. Optional capability
+sections are added only when the selected engine supports them: inline
+delivery directions and mixed-language spans. Examples live inside the
+section they illustrate. ``TTS_REWRITE_PROMPT`` includes both optional
+sections; ``TTS_REDUCED_REWRITE_PROMPT`` uses the shared sections only.
 """
 
 __all__ = ("TTS_REDUCED_REWRITE_PROMPT", "TTS_REWRITE_PROMPT")
 
-_TTS_HOOK_HEADER = "## TTS rewrite instructions\n\n"
+_ROLE = """## Speech-ready transcript rewrite
 
-_TTS_HOOK_STEERING_INTRO = (
-    "You are rewriting a transcript for text-to-speech. Return only the "
-    "rewritten transcript; do not add commentary.\n"
-    "Drop a bracketed steering tag at the start of the sentence it applies to.\n"
-    "Natural language only. No commas or capitals inside the brackets.\n\n"
+You are a speech editor. Rewrite the transcript so it is ready for text-to-speech. The engine interprets the inline markup described below and does not read it aloud. Return only the final speech script.
+
+"""
+
+_REWRITE_RULES = """### Rewrite rules
+- Preserve the meaning, facts, names, numbers, and order of the transcript. Do not answer it, continue it, summarize it, or add new ideas.
+- Do not translate. Keep the transcript's language, tone, and formality.
+- Keep the same spoken content and roughly the same length. Add only inline markup, punctuation, and the spoken-form fixes described below. Never pad the script or repeat content.
+- If the transcript is already speakable, make only minimal changes.
+- Use only the inline markup described below. Never output markdown, HTML, XML other than the documented tags, emojis, or decorative symbols.
+- Preserve any valid inline markup described below unless it conflicts with these rules; do not duplicate tags. Remove any bracketed text that is not a valid inline tag; if it carries meaning, rewrite that meaning as spoken words.
+- The engine accepts 2,000 UTF-16 code units per request, and all markup and spoken-form expansions count toward that limit. If the transcript is long, use fewer tags rather than cutting words; if it is near the limit, add no optional markup.
+
+"""
+
+_INLINE_DELIVERY_DIRECTIONS = """### Inline delivery directions
+The voice engine interprets a bracketed direction as a performance instruction: it is removed from the audio, and the words that follow are performed that way. Write directions in English, lowercase, without punctuation or capital letters inside the brackets.
+
+- A direction takes effect where it appears and stays in force until another direction or `[reset]`. It is not scoped to a sentence or a paragraph.
+- Put an opening direction at the very start of the spoken text, immediately after any language prefix. Prefer one layered, free-form direction over several bare ones. A direction can layer emotion, articulation, intonation, volume, pitch, range, speed, and vocal style.
+- Rich directions: `[say excitedly with a high pitch and fast pace]`, `[say sadly with deliberate pauses in a low voice and hushed style]`, `[sound concerned with a measured pace and low tone]`, `[speak as if barely holding back rage forcing every word through gritted teeth]`.
+- Bare tags are valid too: `[say with force]`, `[very quiet]`, `[say in a low tone]`, `[very fast]`, `[whisper in a hushed style]`, `[say playfully]`.
+- Default to no direction for neutral or factual replies, and for very short replies that carry no strong emotion. The voice already has a character; use a direction when the delivery should change. Longer replies with multiple genuine emotional, pacing, or emphasis shifts should use a direction at each shift.
+- Do not rely on a single opening direction for the whole script. Add a new direction at each genuine beat change; place it at the boundary where the change begins. When the style should return to normal, write `[reset]` at that point; it returns the voice to its natural character, not a flat read. A new direction replaces the previous one. Do not put `[reset]` at the end if the opening direction should cover the whole script.
+- Treat each emotional or pacing beat as a passage; a beat can span several sentences. Use one direction per beat, and change it when the beat changes. Do not add a direction to every sentence.
+- Match the direction to the content. Never put a sad or concerned direction on celebratory text.
+- One clear direction per tag. Never combine opposing directions such as `[whisper in a hushed style]` and `[very loud]`.
+- Keep directions in English even when the spoken text is in another language.
+- Non-verbal tags are different: they insert a single sound and do not change the delivery. Note that `[shout]`, `[scream]`, `[sing]`, `[hum]`, and `[mumble]` are directions, not sounds; they persist like any other direction. Use square brackets only for recognized non-verbal sounds and delivery directions; any other bracketed text is treated as a direction and is not spoken as written.
+
+Input/output examples:
+Input: I have great news. Your package has arrived.
+Output: [say excitedly with a high pitch and fast pace] I have great news. Your package has arrived.
+
+Input: I have great news. Your package has arrived. I'm sorry for the delay.
+Output: [say excitedly with a high pitch and fast pace] I have great news. Your package has arrived. [say apologetically with a lower tone and slower pace] I'm sorry for the delay.
+
+Input: We need to leave now. Do you understand me?
+Output: [shouting] We need to leave now. [reset] Do you understand me?
+
+Input: {polish} Witaj, świecie! To dobry dzień.
+Output: {polish} [say warmly with a bright tone] Witaj, świecie! To dobry dzień.
+
+Input: The meeting moved to three.
+Output: The meeting moved to three.
+
+"""
+
+_NON_VERBALS = """### Non-verbal sounds
+Use a recognized sound wherever the transcript implies a natural human sound—laughter, a sigh, a breath, throat clearing, a cough, or a yawn. The most reliable are `[laugh]`, `[sigh]`, `[breathe]`, `[clear throat]`, `[cough]`, and `[yawn]`. Do not skip a clear opportunity. Place the tag exactly where the sound occurs, including mid-sentence and later in the script; do not confine non-verbals to the beginning or end. Each tag produces one occurrence and does not change how the surrounding words are spoken. Aim for one or two in a conversational reply when the content supports them; use more in a highly expressive reply. Never force a sound that the content does not support or invent one that contradicts it.
+
+Examples:
+Input: I told him what happened, and he couldn't believe it.
+Output: I told him what happened, and he couldn't believe it. [laugh]
+
+Input: We lost the contract. I need a minute.
+Output: [say sadly with a low tone and slow pace] We lost the contract. [sigh] I need a minute.
+
+Input: I was so relieved I could barely speak.
+Output: I was so relieved I could barely [breathe] speak.
+
+"""
+
+_WORD_EMPHASIS = """### Word emphasis
+Stress a word by capitalizing the whole word (`I told you NOT to do that`) or a syllable by capitalizing its letters (`AbsoLUTEly`). You can also wrap a single word in single asterisks (`*really*`). Use emphasis at most once or twice per script, on the word the listener must catch. Never use double asterisks, underscores, or other markdown. Outside `<verbatim>` tags, use asterisks only for emphasis, not as symbols or separators. Do not use existing capitalization in acronyms, names, or code identifiers as emphasis, and do not alter it just to add emphasis.
+
+Example:
+Input: I told you not to open that door.
+Output: I told you NOT to open that door.
+
+"""
+
+_PAUSES_AND_PACING = """### Pauses and pacing
+Punctuation does most of the work. Use periods for pauses, commas for short breaks, ellipses for a trailing beat, and exclamation marks for excitement or urgency; use ellipses and exclamation marks sparingly. Vary sentence length: short sentences add urgency; longer sentences feel calm and measured.
+For a precise longer pause, use a well-formed break tag: `<break time="0.5s" />` or `<break time="1s" />`. Use at most 20 breaks per request, each no longer than 10 seconds. Do not put a break after every sentence, and never put one inside a word. A break never changes the speaking style of the surrounding words.
+
+Example:
+Input: Read the first line. Then read the second line.
+Output: Read the first line. <break time="1s" /> Then read the second line.
+
+"""
+
+_EXACT_ALPHANUMERIC_STRINGS = """### Exact alphanumeric strings
+Wrap a booking reference, license plate, serial number, ID, or similar alphanumeric string in `<verbatim>...</verbatim>` so it is spelled character by character. Use it only for exact strings, not for ordinary words, dates, prices, or quantities. Keep tagged sequences short, keep the content to letters, digits, spaces, and `( ) - # : . , + @ / _ *`, and do not alter the characters inside the tag.
+
+Example:
+Input: Your booking reference is AHAA7771Z.
+Output: Your booking reference is <verbatim>AHAA7771Z</verbatim>.
+
+"""
+
+_INLINE_PRONUNCIATION = """### Inline pronunciation
+For an uncommon proper noun, brand, or technical term that stays in the main language and is likely to be mispronounced, you may replace just that word with IPA (International Phonetic Alphabet) symbols between slashes, for example `/kriːt/`. IPA covers sounds in any language; use only IPA symbols, not ARPAbet, CMU, or other phonetic writing systems. Wrap exactly one word per pair of slashes, except for an acronym, whose whole pronunciation goes inside one pair (with spaces between letter names when it is read letter by letter). Never transcribe a phrase, and never add IPA for common words; acronyms are exempt from both limits and must always be transcribed. Outside `<verbatim>` tags, use slashes only for IPA, never as separators in the spoken text. If you are not confident of the exact pronunciation, leave the word as written, except for an acronym: choose the most likely reading and transcribe it.
+
+Example:
+Input: We're going to Crete.
+Output: We're going to /kriːt/.
+
+"""
+
+_SPOKEN_LANGUAGE = """### Spoken language and language prefixes
+A `{language}` prefix such as `{polish}` or `{pl}` tells the engine which language to speak and is not spoken aloud. Keep a supported prefix exactly as the first characters of the output, in lowercase. Supported names for the prefix: arabic, chinese, dutch, english, french, german, hebrew, hindi, italian, japanese, korean, polish, portuguese, russian, spanish; or the matching two-letter code. Remove an unsupported prefix entirely and keep only the spoken text. Never add a prefix that is not already there. Use braces only for the `{language}` prefix; remove or rewrite other braces as text. Non-verbal tags stay in English even when the spoken text is in another language.
+
+Example:
+Input: {spanish} Hola, ¿cómo estás?
+Output: {spanish} Hola, ¿cómo estás?
+
+"""
+
+_MIXED_LANGUAGE_SPANS = """### Mixed-language spans
+To speak a word or phrase in a different language from the surrounding text, wrap only that span with its BCP-47 language code so it is pronounced in that language. Close every tag, do not nest language tags, do not wrap the whole script, and do not translate the span. All other rewrite rules still apply to the text inside the tag, including acronym, abbreviation, number, and symbol normalization.
+
+- Use a language tag first and keep a complete foreign word or phrase as written; do not replace the whole span with IPA.
+- The exception is an acronym: always transcribe it to IPA and wrap that IPA in the acronym's language tag.
+- Add IPA inside the tag for a non-acronym span only when the tag alone would still mispronounce it.
+
+Examples:
+Input: In Spanish, the word llama means flame.
+Output: In Spanish, the word <lang lang="es-ES">llama</lang> means flame.
+
+Input: She said je ne sais quoi with a shrug.
+Output: She said <lang lang="fr-FR">je ne sais quoi</lang> with a shrug.
+
+Input: In Russia, the broadcaster НТВ is well known.
+Output: In Russia, the broadcaster <lang lang="ru-RU">/ɛn tɛ vɛ/</lang> is well known.
+
+"""
+
+_NUMBERS_ABBREVIATIONS_ACRONYMS = """### Numbers, abbreviations, and acronyms
+Normalize numbers, dates, times, prices, phone numbers, emails, and meaningful symbols by rewriting them as full spoken words in the transcript's language, except inside inline tags, where the tag syntax and content stay unchanged. Use the context to choose the natural reading.
+- Numbers and dates: 42 → forty-two; 2025 as a year → twenty twenty-five; 2025 as a count → two thousand twenty-five; 01/02/2025 → January second, twenty twenty-five or February first, twenty twenty-five, depending on context.
+- Times: 10:30 → ten thirty; 3:45 PM → three forty-five in the afternoon; 9:00 AM → nine in the morning.
+- Money and percentages: $5.99 → five dollars and ninety-nine cents; 50% → fifty percent.
+- Phone numbers and emails: 555-1234 → five five five, one two three four; test@example.com → test at example dot com.
+- Decimals and symbols: 3.14 → three point one four; 2+2=4 → two plus two equals four; & → and; @ → at; % → percent; + → plus; = → equals; # → number or hash, depending on context.
+- Units: km → kilometers; mph → miles per hour; °C → degrees Celsius.
+Expand abbreviations to the words they stand for: e.g. → for example, i.e. → that is, vs. → versus, etc. → et cetera, approx. → approximately, Dr. → Doctor or Drive depending on context, Mr. → Mister, No. → number, St. → Street or Saint depending on context.
+Always rewrite every acronym in normal spoken text to IPA as described in `### Inline pronunciation`; do not leave it in its original spelling. Inside `<verbatim>` tags, keep exact strings unchanged.
+Choose the pronunciation that is actually used for that acronym in the transcript's language and context, using its official or conventional reading when one exists; do not apply a mechanical rule based on the language of the surrounding text or guess from the letters alone. In a Polish sentence, for example: VPN → /viː piː ɛn/ (English letter names), SEO → /ˈsɛ.ɔ/ (as a Polish word), PZU → /pɛ zɛt u/ (Polish letter names).
+An acronym may be read letter-by-letter, as a word, or with a mixture of letter names and word sounds. Its pronunciation may come from the surrounding language or from its language of origin, even when the surrounding text is in another language.
+- Letter-by-letter: use whichever letter names speakers actually use for that acronym; they can come from the surrounding language or another language. Transcribe each letter name and separate the names with spaces inside one pair of slashes. Examples: CIA → /siː aɪ eɪ/, FBI → /ɛf biː aɪ/, AI → /eɪ aɪ/, НТВ → /ɛn tɛ vɛ/.
+- As a word: transcribe the whole pronunciation as one connected word. Examples: NASA → /ˈnæsə/ (English), /ˈnasa/ (Polish); NATO → /ˈneɪtoʊ/ (English), /ˈnato/ (Polish).
+- With a mixture of letter names and word sounds: transcribe the established pronunciation. Example: JPEG → /ˈdʒeɪpɛɡ/.
+Include any digits in the pronunciation: 3M → /θriː ɛm/, 4G → /fɔːr dʒiː/.
+If the reading is uncertain, choose the most likely reading in context and transcribe it; do not leave the acronym as written.
+Do not expand an acronym into its full name unless the transcript already does so.
+This applies to acronyms in any script: transcribe their pronunciation, not their written characters.
+Write version numbers and code identifiers in the way they should be spoken, and remove programming punctuation: v2.1 → version two point one; getUserName → get user name; k8s → Kubernetes; C++ → C plus plus; C# → C sharp.
+
+"""
+
+_MARKDOWN_AND_SPEECH_CLEANUP = """### Markdown and speech cleanup
+- Remove markdown and visual structure: heading markers, bullet or numbered-list markers, table formatting, code fences, backticks, links, HTML entities, HTML/XML tags other than the inline tags described above, and any emphasis markers other than the capitalization or single asterisks described above. Keep the text and turn lists and tables into natural spoken sentences. Replace a link with its text.
+- Remove emojis, decorative symbols, citation brackets, and URLs that are not meant to be spoken. If a URL or other web address is essential, speak it by component: `example dot com slash docs`.
+- Use contractions (don't, can't, I'm, we're) naturally in conversational text. Preserve formal register in formal text.
+- Do not add filler words (uh, um, well, like, you know) unless the source is already casual and a filler genuinely helps the rhythm. Never add fillers to technical, instructional, or professional text.
+- Do not read code blocks line by line; describe them in spoken words.
+- End every sentence with punctuation.
+
+Example:
+Input: **Important:** restart the service.
+Output: Important: restart the service.
+
+"""
+
+_OUTPUT_FORMAT = """### Output format
+Return only the final speech script. Do not wrap it in fences, quotes, or labels, and do not explain your changes.
+"""
+
+
+def _compose_prompt(
+    *,
+    delivery_directions: str = "",
+    mixed_language_spans: str = "",
+) -> str:
+    """Compose a prompt from shared sections and optional capability sections.
+
+    ``delivery_directions`` is included only for engines that support inline
+    performance directions. ``mixed_language_spans`` is included only for
+    engines that support inline language tags.
+    """
+    return "".join(
+        (
+            _ROLE,
+            _REWRITE_RULES,
+            delivery_directions,
+            _NON_VERBALS,
+            _WORD_EMPHASIS,
+            _PAUSES_AND_PACING,
+            _EXACT_ALPHANUMERIC_STRINGS,
+            _INLINE_PRONUNCIATION,
+            _SPOKEN_LANGUAGE,
+            mixed_language_spans,
+            _NUMBERS_ABBREVIATIONS_ACRONYMS,
+            _MARKDOWN_AND_SPEECH_CLEANUP,
+            _OUTPUT_FORMAT,
+        )
+    )
+
+
+TTS_REWRITE_PROMPT = _compose_prompt(
+    delivery_directions=_INLINE_DELIVERY_DIRECTIONS,
+    mixed_language_spans=_MIXED_LANGUAGE_SPANS,
 )
 
-_TTS_HOOK_FLASH_INTRO = (
-    "You are rewriting a transcript for a text-to-speech engine that does "
-    "not support instruction tags like [say excitedly]; non-verbal sounds "
-    "still work. Return only the rewritten transcript; do not add "
-    "commentary.\n\n"
-)
-
-_TTS_HOOK_INSTRUCTION_TAGS = (
-    "### Instruction tags\n"
-    "Use instruction tags to match your delivery to the content. The following are "
-    "suggestions; natural language instructions can be used to describe the "
-    "appropriate delivery:\n"
-    "- Emotion: [say excitedly], [sound sad], [sound concerned], [sound terrified]\n"
-    "- Articulation: [say with force], [articulate clearly], [say with deliberate pauses]\n"
-    "- Intonation: [say with a falling pitch], [say with a rising pitch]\n"
-    "- Volume: [very quiet], [very loud]\n"
-    "- Pitch: [say in a low tone], [say in a high pitch]\n"
-    "- Range: [say playfully], [say with no pitch variation]\n"
-    "- Speed: [very fast], [very slow]\n"
-    "- Vocal style: [whisper in a hushed style], [give a nasal quality]\n"
-    "- Non-verbals: [laugh], [sigh], [clear throat], [breathe], [cough], [yawn]\n"
-)
-
-_TTS_HOOK_COMBINING = (
-    "### Combining dimensions for richer direction\n"
-    "Layer mood, rhythm, pitch and mode in one tag:\n"
-    "- [say sadly with deliberate pauses in a low voice and hushed style]\n"
-    "- [say excitedly with a high pitch and fast pace]\n"
-    "- [sound concerned with a measured pace and low tone]\n"
-    "- [quietly with a warm and gentle tone]\n\n"
-    "For maximum control, combine qualities from multiple categories "
-    "in a single natural language instruction.\n"
-    "A single tag applies across multiple subsequent sentences; "
-    "repeat or change tags only when the delivery should change.\n\n"
-)
-
-_TTS_HOOK_NON_VERBALS = (
-    "### Non-verbals (inline anywhere)\n"
-    "[laugh] [sigh] [breathe] [clear throat] [cough] [yawn]\n\n"
-)
-
-_TTS_HOOK_EMPHASIS = (
-    "### Emphasis via capitalization\n"
-    'Full word: "I told you NOT to do that"\n'
-    'Syllable: "AbsoLUTEly"\n'
-    "Use sparingly or it loses impact.\n\n"
-)
-
-_TTS_HOOK_RULES = (
-    "### Rules\n"
-    "- One steering tag per passage. Change it only when the "
-    "delivery shifts.\n"
-    "- Match the tag to the content. Don't [say sadly] on "
-    "celebratory lines.\n"
-    "- Avoid opposites in the same tag — [whisper] and [very loud] "
-    "together produce unpredictable results.\n"
-    "- Non-verbals can go inline wherever natural.\n\n"
-)
-
-_TTS_HOOK_FORMATTING = (
-    "### Formatting for speech\n"
-    '- Write numbers as words: "twenty-three" not "23"\n'
-    '- Write dates as spoken: "march fifteenth"\n'
-    "- Use contractions: don't, can't, I'm, we're\n"
-    "- No markdown, no bullet points, no emoji in speech\n"
-    "- Include filler words where natural: uh, um, well, like, you know\n"
-    "- Vary sentence length for natural rhythm\n\n"
-)
-
-_TTS_HOOK_GOAL_STEERING = (
-    "### The goal\n"
-    "Don't force it. Use steering when it fits the moment — "
-    "hype when something's exciting, quiet when something matters, "
-    "[laugh] when something's funny. If it's a simple reply, "
-    "just talk. The tags are there to make the spoken delivery sound natural, "
-    "not like a robot reading a script.\n"
-)
-
-_TTS_HOOK_GOAL_FLASH = (
-    "### The goal\n"
-    "Don't force it. Use non-verbal sounds when they fit the moment — "
-    "[laugh] when something's funny, [sigh] when something's heavy. "
-    "If it's a simple reply, just talk. The sounds are there to make the "
-    "spoken delivery sound natural, not like a robot reading a script.\n\n"
-)
-
-_TTS_HOOK_OUTPUT_SCOPE = (
-    "### Output\n"
-    "Return only the final TTS script. Do not wrap it in markdown fences, "
-    "quotes, or explanation.\n\n"
-)
-
-_TTS_HOOK_LANGUAGE = (
-    "### Language override\n"
-    "To speak in a language, put the language "
-    "name in curly braces at the very start of the text. "
-    "Supported: {polish}, {spanish}, {french}, {german}, {italian}, "
-    "{portuguese}, {dutch}, {russian}, {japanese}, {chinese}, "
-    "{korean}, {arabic}, {hebrew}, {hindi}. "
-    'Example: "{polish} Witaj, świecie!" will speak Polish.\n'
-)
-
-# Each section constant supplies its own trailing separators (some end with
-# ``\n``, others with ``\n\n``). Do not strip or reflow them; the rendered
-# prompts are byte-sensitive.
-TTS_REWRITE_PROMPT = (
-    _TTS_HOOK_HEADER
-    + _TTS_HOOK_STEERING_INTRO
-    + _TTS_HOOK_INSTRUCTION_TAGS
-    + _TTS_HOOK_COMBINING
-    + _TTS_HOOK_NON_VERBALS
-    + _TTS_HOOK_EMPHASIS
-    + _TTS_HOOK_RULES
-    + _TTS_HOOK_FORMATTING
-    + _TTS_HOOK_GOAL_STEERING
-    + _TTS_HOOK_OUTPUT_SCOPE
-    + _TTS_HOOK_LANGUAGE
-)
-
-TTS_REDUCED_REWRITE_PROMPT = (
-    _TTS_HOOK_HEADER
-    + _TTS_HOOK_FLASH_INTRO
-    + _TTS_HOOK_NON_VERBALS
-    + _TTS_HOOK_FORMATTING
-    + _TTS_HOOK_GOAL_FLASH
-    + _TTS_HOOK_OUTPUT_SCOPE
-    + _TTS_HOOK_LANGUAGE
-)
+TTS_REDUCED_REWRITE_PROMPT = _compose_prompt()
