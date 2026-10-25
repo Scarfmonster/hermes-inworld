@@ -33,7 +33,9 @@ from ._common import (
     RETRY_POLICY_DEFAULTS,
     api_key,
     compute_retry_backoff,
+    compute_retry_delay,
     is_retryable_http_status,
+    is_retryable_llm_error,
     parse_retry_after_seconds,
     read_hermes_config,
 )
@@ -221,35 +223,64 @@ def _clean_rewrite_output(content: str) -> str:
     return fence.group(1).strip() if fence else clean
 
 
-def _rewrite_tts_text(text: str, system_prompt: str) -> str:
-    """Rewrite ``text`` with the auxiliary LLM, falling back on any failure."""
+def _call_llm_rewrite(transcript: str, system_prompt: str) -> str:
+    """Make one auxiliary LLM rewrite attempt and return cleaned content."""
+    from agent.auxiliary_client import call_llm
+
+    response = call_llm(
+        task=_TTS_REWRITE_TASK,
+        messages=[
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": f"TRANSCRIPT TO REWRITE:\n{transcript}"},
+        ],
+        temperature=_TTS_REWRITE_TEMPERATURE,
+    )
+    return _clean_rewrite_output(_extract_auxiliary_message_content(response))
+
+
+def _rewrite_tts_text(text: str, system_prompt: str, policy: dict[str, Any]) -> str:
+    """Rewrite ``text`` with the auxiliary LLM, retrying transient failures.
+
+    Retries follow ``policy`` (the shared TTS ``retry`` block) and fall
+    back to the original text once the policy is exhausted or a
+    non-transient error occurs. Only ``Exception`` is caught so
+    cancellation signals propagate.
+    """
     transcript = text.strip()
     if not transcript:
         return text
-    try:
-        from agent.auxiliary_client import call_llm
-
-        response = call_llm(
-            task=_TTS_REWRITE_TASK,
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": f"TRANSCRIPT TO REWRITE:\n{transcript}"},
-            ],
-            temperature=_TTS_REWRITE_TEMPERATURE,
-        )
-        rewritten = _clean_rewrite_output(_extract_auxiliary_message_content(response))
-        if not rewritten:
-            logger.warning("Inworld TTS rewrite returned empty text; using original.")
-            return text
-        logger.debug(
-            "Inworld TTS rewrite applied (%d -> %d chars)",
-            len(transcript),
-            len(rewritten),
-        )
-        return rewritten
-    except Exception as exc:
-        logger.warning("Inworld TTS rewrite failed; using original text: %s", exc)
-        return text
+    for attempt in range(policy["max_retries"] + 1):
+        try:
+            rewritten = _call_llm_rewrite(transcript, system_prompt)
+        except Exception as exc:
+            is_last_attempt = attempt >= policy["max_retries"]
+            if is_last_attempt or not is_retryable_llm_error(exc, policy):
+                logger.warning(
+                    "Inworld TTS rewrite failed; using original text: %s", exc
+                )
+                return text
+            backoff = compute_retry_delay(exc, attempt, policy)
+            logger.warning(
+                "Inworld TTS rewrite failed (%s) — retry %d/%d in %.1fs",
+                exc,
+                attempt + 1,
+                policy["max_retries"],
+                backoff,
+            )
+            time.sleep(backoff)
+        else:
+            if not rewritten:
+                logger.warning(
+                    "Inworld TTS rewrite returned empty text; using original."
+                )
+                return text
+            logger.debug(
+                "Inworld TTS rewrite applied (%d -> %d chars)",
+                len(transcript),
+                len(rewritten),
+            )
+            return rewritten
+    return text
 
 
 def _rewrite_prompt_for_model(model_id: str | None) -> str | None:
@@ -261,13 +292,13 @@ def _rewrite_prompt_for_model(model_id: str | None) -> str | None:
     return None
 
 
-def _apply_steering_rewrite(text: str, model_id: str) -> str:
+def _apply_steering_rewrite(text: str, model_id: str, policy: dict[str, Any]) -> str:
     """Rewrite text for the resolved model, or return it unchanged."""
     rewrite_prompt = _rewrite_prompt_for_model(model_id)
     if rewrite_prompt is None:
         _warn_tts_rewrite_skipped_once(model_id)
         return text
-    return _rewrite_tts_text(text, rewrite_prompt)
+    return _rewrite_tts_text(text, rewrite_prompt, policy)
 
 
 def _build_synthesis_payload(
@@ -504,13 +535,14 @@ class InworldTTSProvider(TTSProvider):
         return value
 
     def _retry_policy_config(self) -> dict[str, Any]:
-        """Return the resolved retry policy for TTS HTTP requests.
+        """Return the resolved retry policy for TTS HTTP and rewrite calls.
 
         Falls back to ``RETRY_POLICY_DEFAULTS`` for any key that is
-        missing, non-numeric, or out of range. Per-policy keys:
-        ``max_retries``, ``initial_backoff``, ``max_backoff``,
-        ``backoff_multiplier``, ``retry_on_5xx``, ``retry_on_429``,
-        ``retry_on_network_error``.
+        missing, non-numeric, or out of range. The same policy drives the
+        TTS HTTP requests and the optional steering-rewrite LLM call.
+        Per-policy keys: ``max_retries``, ``initial_backoff``,
+        ``max_backoff``, ``backoff_multiplier``, ``retry_on_5xx``,
+        ``retry_on_429``, ``retry_on_network_error``.
         """
         cfg = self._get_provider_config()
         retry_cfg = cfg.get("retry", {})
@@ -663,11 +695,11 @@ class InworldTTSProvider(TTSProvider):
         key = api_key()
         voice_id = voice or self._voice_config()
         model_id = self._configured_model(model)
+        retry_policy = self._retry_policy_config()
         if self._steering_rewrite_config():
-            text = _apply_steering_rewrite(text, model_id)
+            text = _apply_steering_rewrite(text, model_id, retry_policy)
         delivery_mode = self._delivery_mode_config()
         timeout = self._tts_timeout_config()
-        retry_policy = self._retry_policy_config()
 
         payload = _build_synthesis_payload(
             text, voice_id, model_id, speed, format, delivery_mode

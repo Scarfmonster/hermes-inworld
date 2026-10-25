@@ -5,6 +5,7 @@ provider modules (see :mod:`.tts` and :mod:`.stt`).
 """
 
 import os
+from collections.abc import Iterator
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 from typing import Any
@@ -45,19 +46,43 @@ def is_retryable_http_status(code: int, retry_on_5xx: bool, retry_on_429: bool) 
     return False
 
 
-def parse_retry_after_seconds(error: Exception) -> float | None:
-    """Read the ``Retry-After`` header from an HTTPError, if present.
+def _exception_chain(error: BaseException) -> Iterator[BaseException]:
+    """Yield ``error`` and its ``__cause__``/``__context__`` chain.
 
-    Returns the wait duration in seconds (integer seconds or HTTP-date),
-    or ``None`` when the header is missing/unparseable so the caller can
-    fall back to the policy's exponential backoff.
+    Cycle protection is required because re-raised exceptions can form a
+    loop (``__context__`` pointing back at an ancestor).
     """
-    headers = getattr(error, "headers", None)
+    seen: set[int] = set()
+    current: BaseException | None = error
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        yield current
+        current = current.__cause__ or current.__context__
+
+
+def _header_retry_after(headers: object) -> Any:
+    """Return the raw ``Retry-After`` value from a header mapping, if any.
+
+    Tries both casings so plain ``dict`` headers (which are
+    case-sensitive) and ``HTTPMessage``/``httpx.Headers`` both work.
+    """
     if headers is None:
         return None
-    raw = headers.get("Retry-After") if hasattr(headers, "get") else None
-    if raw is None:
+    getter = getattr(headers, "get", None)
+    if getter is None:
         return None
+    for name in ("Retry-After", "retry-after"):
+        try:
+            raw = getter(name)
+        except Exception:
+            return None
+        if raw is not None:
+            return raw
+    return None
+
+
+def _parse_retry_after_value(raw: Any) -> float | None:
+    """Parse an integer-seconds or HTTP-date ``Retry-After`` value."""
     try:
         return max(0.0, float(raw))
     except (TypeError, ValueError):
@@ -74,6 +99,125 @@ def parse_retry_after_seconds(error: Exception) -> float | None:
         return None
 
 
+def parse_retry_after_seconds(error: Exception) -> float | None:
+    """Read the ``Retry-After`` header from an exception, if present.
+
+    Checks the exception's own ``headers`` first (the ``urllib.error``
+    shape), then ``error.response.headers`` (the OpenAI/httpx shape), then
+    walks the ``__cause__``/``__context__`` chain. Returns the wait
+    duration in seconds (integer seconds or HTTP-date), or ``None`` when
+    no header is found/unparseable so the caller can fall back to the
+    policy's exponential backoff.
+    """
+    for exc in _exception_chain(error):
+        raw = _header_retry_after(getattr(exc, "headers", None))
+        if raw is None:
+            response = getattr(exc, "response", None)
+            raw = _header_retry_after(getattr(response, "headers", None))
+        if raw is not None:
+            return _parse_retry_after_value(raw)
+    return None
+
+
+_HTTP_STATUS_ATTRS = ("status_code", "status", "http_status", "code")
+
+_NETWORK_ERROR_CLASS_NAMES: frozenset[str] = frozenset(
+    {
+        "APIConnectionError",
+        "APITimeoutError",
+        "TimeoutException",
+        "TimeoutError",
+        "ConnectError",
+        "ConnectTimeout",
+        "ReadTimeout",
+        "ReadError",
+        "WriteTimeout",
+        "PoolTimeout",
+        "NetworkError",
+        "TransportError",
+        "ConnectionError",
+        "ConnectionResetError",
+        "ConnectionAbortedError",
+        "ConnectionRefusedError",
+        "RemoteDisconnected",
+        "IncompleteRead",
+        "URLError",
+        "SSLError",
+    }
+)
+
+_NETWORK_ERROR_MESSAGE_MARKERS: tuple[str, ...] = (
+    "connection reset",
+    "connection refused",
+    "timed out",
+    "timeout",
+    "temporary failure in name resolution",
+    "incomplete chunked read",
+    "peer closed connection",
+    "response ended prematurely",
+    "remote end closed connection",
+)
+
+
+def get_exception_http_status(error: BaseException) -> int | None:
+    """Return an HTTP status code carried by ``error`` or its chain.
+
+    Supports OpenAI SDK ``status_code`` attributes, ``response`` objects,
+    and ``urllib.error.HTTPError`` (``code``). Only integer values are
+    accepted because some exception classes use ``code`` for a string
+    error identifier.
+    """
+    for exc in _exception_chain(error):
+        for attr in _HTTP_STATUS_ATTRS:
+            value = getattr(exc, attr, None)
+            if isinstance(value, int) and not isinstance(value, bool):
+                return value
+        response = getattr(exc, "response", None)
+        if response is None:
+            continue
+        for attr in ("status_code", "status"):
+            value = getattr(response, attr, None)
+            if isinstance(value, int) and not isinstance(value, bool):
+                return value
+    return None
+
+
+def is_network_error(error: BaseException) -> bool:
+    """Return True when ``error`` or its chain looks like a transport error.
+
+    Uses class-name matching (so OpenAI/httpx exception classes are
+    recognized without importing them) plus a conservative set of message
+    markers. Unknown failures return False.
+    """
+    for exc in _exception_chain(error):
+        names = {cls.__name__ for cls in type(exc).__mro__}
+        if names & _NETWORK_ERROR_CLASS_NAMES:
+            return True
+        message = str(exc).lower()
+        if any(marker in message for marker in _NETWORK_ERROR_MESSAGE_MARKERS):
+            return True
+    return False
+
+
+def is_retryable_llm_error(error: BaseException, policy: dict[str, Any]) -> bool:
+    """Return True when an LLM client error is transient per ``policy``.
+
+    A known HTTP status is authoritative: only 429/5xx are retried (per
+    the ``retry_on_429``/``retry_on_5xx`` flags). Without a status, only
+    connection/timeout failures are retried, and only when
+    ``retry_on_network_error`` is enabled. Anything unrecognized is not
+    retried.
+    """
+    status = get_exception_http_status(error)
+    if isinstance(status, int):
+        return is_retryable_http_status(
+            status,
+            bool(policy.get("retry_on_5xx", False)),
+            bool(policy.get("retry_on_429", False)),
+        )
+    return bool(policy.get("retry_on_network_error", False)) and is_network_error(error)
+
+
 def compute_retry_backoff(
     attempt: int,
     initial_backoff: float,
@@ -88,6 +232,23 @@ def compute_retry_backoff(
     if attempt < 0:
         attempt = 0
     return min(initial_backoff * (backoff_multiplier**attempt), max_backoff)
+
+
+def compute_retry_delay(
+    error: Exception,
+    attempt: int,
+    policy: dict[str, Any],
+) -> float:
+    """Prefer a server-provided ``Retry-After`` over exponential backoff."""
+    retry_after = parse_retry_after_seconds(error)
+    if retry_after is not None:
+        return retry_after
+    return compute_retry_backoff(
+        attempt,
+        policy["initial_backoff"],
+        policy["backoff_multiplier"],
+        policy["max_backoff"],
+    )
 
 
 # Defaults for the per-provider ``retry:`` config block. Each provider

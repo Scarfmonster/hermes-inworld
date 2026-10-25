@@ -37,7 +37,7 @@ tts:
     steering_rewrite: false   # add steering tags with an auxiliary LLM
     delivery_mode: "CREATIVE" # STABLE, BALANCED, or CREATIVE
     timeout: 60               # seconds
-    retry:
+    retry:                    # TTS HTTP requests and the steering rewrite
       max_retries: 3
       initial_backoff: 1.0
       backoff_multiplier: 2.0
@@ -132,12 +132,24 @@ Audio formats the API does not accept are converted to OGG_OPUS with
 
 ## Retries and timeouts
 
-Both providers retry 5xx, 429, and network errors with exponential backoff and
-respect `Retry-After` on 429. Defaults are 3 retries, starting at 1 second,
-doubling up to 30 seconds. `retry_on_5xx`, `retry_on_429`, and
+The TTS HTTP call, the optional TTS steering rewrite, and STT HTTP calls retry
+5xx, 429, and network errors with the same exponential backoff and
+`Retry-After` handling. Defaults are 3 retries, starting at 1 second, doubling
+up to 30 seconds. `retry_on_5xx`, `retry_on_429`, and
 `retry_on_network_error` are all enabled. TTS times out after 60 seconds; STT
 uses 120 seconds for HTTP and ffmpeg, and 10 seconds for ffprobe. Set
 `retry.max_retries: 0` to disable retries.
+
+The steering rewrite is an auxiliary LLM call, so it is also subject to
+Hermes's `auxiliary.transient_retries` and provider fallback.
+`tts.inworld-tts.retry.max_retries: 0` removes only the plugin's additional
+rewrite attempts; Hermes still retries transient auxiliary failures. A failing
+rewrite can therefore consume several auxiliary timeouts before the original
+text is spoken. To bound that latency, lower `max_retries`, lower
+`auxiliary.tts_audio_tags.timeout`, or disable `steering_rewrite`.
+`auxiliary.transient_retries: 0` also disables Hermes-side transient retries,
+but that setting is global to all auxiliary tasks. The plugin does not retry
+non-429 4xx/auth errors or empty rewrite responses.
 
 ## Troubleshooting
 
