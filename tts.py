@@ -5,6 +5,11 @@ Supports two models: ``inworld-tts-2`` (instruction tags such as
 ``inworld-tts-2-flash`` (non-verbal sounds only; instruction tags are
 ignored server-side). Both support multi-language output via a
 ``{language}`` prefix and configurable delivery modes.
+
+When ``tts.inworld-tts.steering_rewrite`` is enabled, the text is first
+rewritten by an auxiliary LLM (task ``tts_audio_tags``) to add expressive
+tags and formatting appropriate to the resolved model before synthesis. The
+legacy first-turn ``pre_llm_call`` prompt injection has been removed.
 """
 
 from __future__ import annotations
@@ -17,7 +22,6 @@ import re
 import shutil
 import time
 import urllib.error
-import urllib.parse
 import urllib.request
 from pathlib import Path
 from typing import Any
@@ -29,12 +33,11 @@ from ._common import (
     RETRY_POLICY_DEFAULTS,
     api_key,
     compute_retry_backoff,
-    is_provider_active,
     is_retryable_http_status,
     parse_retry_after_seconds,
     read_hermes_config,
 )
-from ._tts_prompts import TTS_FLASH_HOOK_CONTEXT, TTS_HOOK_CONTEXT
+from ._tts_prompts import TTS_REDUCED_REWRITE_PROMPT, TTS_REWRITE_PROMPT
 
 logger = logging.getLogger(__name__)
 
@@ -76,6 +79,11 @@ _DEFAULT_DELIVERY_MODE = "CREATIVE"
 # Default HTTP timeout (seconds) for the synchronous TTS endpoint. The
 # value in ``tts.inworld-tts.timeout`` overrides this at runtime.
 _TTS_HTTP_TIMEOUT_SECONDS = 60
+
+# Auxiliary LLM task used to rewrite TTS text when ``steering_rewrite`` is
+# enabled. Shared with the Gemini/xAI tag rewriting task in Hermes.
+_TTS_REWRITE_TASK = "tts_audio_tags"
+_TTS_REWRITE_TEMPERATURE = 0.7
 
 # ── Language override ────────────────────────────────────────────
 # Full-word language names → ISO codes for GA Inworld TTS-2 languages.
@@ -178,21 +186,88 @@ def _is_inworld_flash_model(model_id: str | None) -> bool:
     return _normalized_model_id(model_id) in _FLASH_MODEL_IDS
 
 
-_warned_skipped_tts_context_models: set[str] = set()
+_warned_skipped_tts_rewrite_models: set[str] = set()
 
 
-def _warn_tts_context_skipped_once(model_id: str) -> None:
+def _warn_tts_rewrite_skipped_once(model_id: str) -> None:
     key = _normalized_model_id(model_id)
-    if key in _warned_skipped_tts_context_models:
+    if key in _warned_skipped_tts_rewrite_models:
         return
-    _warned_skipped_tts_context_models.add(key)
+    _warned_skipped_tts_rewrite_models.add(key)
     logger.warning(
-        "Inworld model %r is not a current TTS-2 model; skipping TTS prompt "
-        "context. Use %s or %s.",
+        "Inworld model %r is not a current TTS-2 model; skipping TTS rewrite. "
+        "Use %s or %s.",
         model_id,
         _MODEL_TTS2,
         _MODEL_TTS2_FLASH,
     )
+
+
+def _extract_auxiliary_message_content(response: Any) -> str:
+    """Return the message content string from an OpenAI-style response."""
+    try:
+        content = response.choices[0].message.content
+    except Exception:
+        return ""
+    return content if isinstance(content, str) else ""
+
+
+def _clean_rewrite_output(content: str) -> str:
+    """Strip surrounding whitespace and a fence wrapping the whole output."""
+    clean = (content or "").strip()
+    fence = re.fullmatch(
+        r"```(?:[A-Za-z0-9_-]+)?\s*(.*?)\s*```", clean, flags=re.DOTALL
+    )
+    return fence.group(1).strip() if fence else clean
+
+
+def _rewrite_tts_text(text: str, system_prompt: str) -> str:
+    """Rewrite ``text`` with the auxiliary LLM, falling back on any failure."""
+    transcript = text.strip()
+    if not transcript:
+        return text
+    try:
+        from agent.auxiliary_client import call_llm
+
+        response = call_llm(
+            task=_TTS_REWRITE_TASK,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": f"TRANSCRIPT TO REWRITE:\n{transcript}"},
+            ],
+            temperature=_TTS_REWRITE_TEMPERATURE,
+        )
+        rewritten = _clean_rewrite_output(_extract_auxiliary_message_content(response))
+        if not rewritten:
+            logger.warning("Inworld TTS rewrite returned empty text; using original.")
+            return text
+        logger.debug(
+            "Inworld TTS rewrite applied (%d -> %d chars)",
+            len(transcript),
+            len(rewritten),
+        )
+        return rewritten
+    except Exception as exc:
+        logger.warning("Inworld TTS rewrite failed; using original text: %s", exc)
+        return text
+
+
+def _rewrite_prompt_for_model(model_id: str | None) -> str | None:
+    """Return the rewrite prompt for ``model_id``, or ``None`` to skip."""
+    if _supports_inworld_steering(model_id):
+        return TTS_REWRITE_PROMPT
+    if _is_inworld_flash_model(model_id):
+        return TTS_REDUCED_REWRITE_PROMPT
+    return None
+
+
+def _apply_steering_rewrite(text: str, model_id: str) -> str:
+    """Rewrite text for the resolved model, or return it unchanged."""
+    rewrite_prompt = _rewrite_prompt_for_model(model_id)
+    if rewrite_prompt is None:
+        _warn_tts_rewrite_skipped_once(model_id)
+        return text
+    return _rewrite_tts_text(text, rewrite_prompt)
 
 
 def _build_synthesis_payload(
@@ -290,7 +365,7 @@ def _decode_synthesis_response(response) -> bytes:
 
 
 class InworldTTSProvider(TTSProvider):
-    """Inworld TTS-2 provider with steering support."""
+    """Inworld TTS-2 provider with optional LLM steering rewrite."""
 
     @property
     def name(self) -> str:
@@ -343,9 +418,8 @@ class InworldTTSProvider(TTSProvider):
         type). A non-dict ``tts`` section is treated as empty. The result
         is cached for the lifetime of this provider instance — config
         files are not expected to change at runtime for the per-provider
-        section (delivery_mode, timeout, retry, etc.); only the top-level
-        ``tts.provider`` selection is re-checked on every hook call via
-        ``is_provider_active`` from ``_common``.
+        section (delivery_mode, steering_rewrite, timeout, retry, etc.).
+        Restart Hermes/gateway after changing these values.
         """
         if self._HERMES_CONFIG_CACHE is not None:
             return self._HERMES_CONFIG_CACHE
@@ -359,7 +433,7 @@ class InworldTTSProvider(TTSProvider):
         """Return the effective model for this provider.
 
         Reads ``tts.inworld-tts.model`` (alongside ``voice``) fresh so a
-        gateway-time change applies on the next first turn. Precedence:
+        gateway-time change applies on the next synthesis. Precedence:
         the plugin-scoped ``model`` key, then the top-level ``tts.model``
         Hermes forwards, then the ``forwarded`` argument, then
         ``DEFAULT_MODEL``. Blank, non-string, or malformed values are
@@ -396,6 +470,20 @@ class InworldTTSProvider(TTSProvider):
             _DEFAULT_DELIVERY_MODE,
         )
         return _DEFAULT_DELIVERY_MODE
+
+    def _steering_rewrite_config(self) -> bool:
+        """Return whether the auxiliary TTS rewrite pass is enabled.
+
+        Reads ``tts.inworld-tts.steering_rewrite`` (default ``false``).
+        Accepts booleans and common string spellings. The provider config
+        block is cached per instance, so changing this value requires a
+        Hermes/gateway restart.
+        """
+        cfg = self._get_provider_config()
+        raw = cfg.get("steering_rewrite", False)
+        if isinstance(raw, str):
+            return raw.strip().lower() in {"1", "true", "yes", "on"}
+        return bool(raw)
 
     def _tts_timeout_config(self) -> int:
         """Return the HTTP request timeout (seconds) for TTS.
@@ -547,6 +635,11 @@ class InworldTTSProvider(TTSProvider):
     ) -> str:
         """Synthesize speech via Inworld TTS-2 API.
 
+        When ``tts.inworld-tts.steering_rewrite`` is enabled, the text is
+        first rewritten by the auxiliary LLM (task ``tts_audio_tags``) using
+        the prompt appropriate for the resolved model. Any rewrite failure
+        or empty response falls back to the original text.
+
         Args:
             text: Text to speak (can include steering tags like [say excitedly])
             output_path: Where to write the audio file
@@ -570,6 +663,8 @@ class InworldTTSProvider(TTSProvider):
         key = api_key()
         voice_id = voice or self._voice_config()
         model_id = self._configured_model(model)
+        if self._steering_rewrite_config():
+            text = _apply_steering_rewrite(text, model_id)
         delivery_mode = self._delivery_mode_config()
         timeout = self._tts_timeout_config()
         retry_policy = self._retry_policy_config()
@@ -611,36 +706,3 @@ class InworldTTSProvider(TTSProvider):
                 },
             ],
         }
-
-    # ── Hooks ────────────────────────────────────────────────────────
-
-    def register_hooks(self, ctx):
-        """Register lifecycle hooks for TTS context injection."""
-        ctx.register_hook("pre_llm_call", self._on_pre_llm_call)
-
-    def _on_pre_llm_call(
-        self, is_first_turn: bool, **kwargs: Any
-    ) -> dict[str, str] | None:
-        """Inject model-appropriate guidance on the first turn only.
-
-        Full steering instructions are injected for ``inworld-tts-2``; the
-        Flash model gets the reduced context (non-verbals and formatting)
-        because it ignores instruction tags. Deprecated or unknown model
-        IDs get no context and a one-time warning. Skipped entirely when
-        ``inworld-tts`` is not the configured TTS provider. The
-        ``is_provider_active`` helper re-reads the YAML config each
-        invocation so a gateway-time change of ``tts.provider``
-        propagates immediately.
-        """
-        if not is_first_turn:
-            return None
-        if not is_provider_active("tts", _PROVIDER_NAME):
-            return None
-
-        model_id = self._configured_model()
-        if _supports_inworld_steering(model_id):
-            return {"context": TTS_HOOK_CONTEXT}
-        if _is_inworld_flash_model(model_id):
-            return {"context": TTS_FLASH_HOOK_CONTEXT}
-        _warn_tts_context_skipped_once(model_id)
-        return None

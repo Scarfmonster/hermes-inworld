@@ -17,5 +17,4 @@ def register(ctx):
     ctx.register_tts_provider(tts)
     ctx.register_transcription_provider(stt)
 
-    tts.register_hooks(ctx)
     stt.register_hooks(ctx)

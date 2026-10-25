@@ -1,23 +1,32 @@
-"""First-turn TTS hook context prompts for the Inworld TTS provider.
+"""TTS rewrite prompts for the Inworld TTS provider.
 
-The full steering prompt is intentionally preserved byte-for-byte; the
-Flash variant reuses the model-neutral sections and omits the steering
-catalog because Flash ignores instruction tags.
+These prompts are sent to the auxiliary LLM (task ``tts_audio_tags``) when
+``tts.inworld-tts.steering_rewrite`` is enabled. They are deliberately
+model-agnostic: each prompt describes the capabilities of the target engine
+and model selection happens in code.
+
+The full rewrite prompt keeps the original section structure and
+composition; the reduced prompt reuses the model-neutral sections and omits
+the steering catalog because the reduced-capability engine ignores
+instruction tags.
 """
 
-__all__ = ("TTS_FLASH_HOOK_CONTEXT", "TTS_HOOK_CONTEXT")
+__all__ = ("TTS_REDUCED_REWRITE_PROMPT", "TTS_REWRITE_PROMPT")
 
-_TTS_HOOK_HEADER = "## How to Talk When Using TTS (`text_to_speech`)\n\n"
+_TTS_HOOK_HEADER = "## TTS rewrite instructions\n\n"
 
 _TTS_HOOK_STEERING_INTRO = (
-    "When your response gets spoken aloud, drop a bracketed "
-    "steering tag at the start of the sentence it applies to.\n"
+    "You are rewriting a transcript for text-to-speech. Return only the "
+    "rewritten transcript; do not add commentary.\n"
+    "Drop a bracketed steering tag at the start of the sentence it applies to.\n"
     "Natural language only. No commas or capitals inside the brackets.\n\n"
 )
 
 _TTS_HOOK_FLASH_INTRO = (
-    "The selected model is Realtime TTS-2 Flash. Instruction tags like "
-    "[say excitedly] are ignored; non-verbal sounds still work.\n\n"
+    "You are rewriting a transcript for a text-to-speech engine that does "
+    "not support instruction tags like [say excitedly]; non-verbal sounds "
+    "still work. Return only the rewritten transcript; do not add "
+    "commentary.\n\n"
 )
 
 _TTS_HOOK_INSTRUCTION_TAGS = (
@@ -99,16 +108,10 @@ _TTS_HOOK_GOAL_FLASH = (
     "spoken delivery sound natural, not like a robot reading a script.\n\n"
 )
 
-_TTS_HOOK_SCOPE_STEERING = (
-    "### When to use\n"
-    "Use this steering in the input to text_to_speech tool only. "
-    "Don't use it in the normal text output to the user.\n\n"
-)
-
-_TTS_HOOK_SCOPE_FLASH = (
-    "### When to use\n"
-    "Use this guidance in the input to text_to_speech tool only. "
-    "Don't use it in the normal text output to the user.\n\n"
+_TTS_HOOK_OUTPUT_SCOPE = (
+    "### Output\n"
+    "Return only the final TTS script. Do not wrap it in markdown fences, "
+    "quotes, or explanation.\n\n"
 )
 
 _TTS_HOOK_LANGUAGE = (
@@ -123,8 +126,8 @@ _TTS_HOOK_LANGUAGE = (
 
 # Each section constant supplies its own trailing separators (some end with
 # ``\n``, others with ``\n\n``). Do not strip or reflow them; the rendered
-# contexts are byte-sensitive.
-TTS_HOOK_CONTEXT = (
+# prompts are byte-sensitive.
+TTS_REWRITE_PROMPT = (
     _TTS_HOOK_HEADER
     + _TTS_HOOK_STEERING_INTRO
     + _TTS_HOOK_INSTRUCTION_TAGS
@@ -134,16 +137,16 @@ TTS_HOOK_CONTEXT = (
     + _TTS_HOOK_RULES
     + _TTS_HOOK_FORMATTING
     + _TTS_HOOK_GOAL_STEERING
-    + _TTS_HOOK_SCOPE_STEERING
+    + _TTS_HOOK_OUTPUT_SCOPE
     + _TTS_HOOK_LANGUAGE
 )
 
-TTS_FLASH_HOOK_CONTEXT = (
+TTS_REDUCED_REWRITE_PROMPT = (
     _TTS_HOOK_HEADER
     + _TTS_HOOK_FLASH_INTRO
     + _TTS_HOOK_NON_VERBALS
     + _TTS_HOOK_FORMATTING
     + _TTS_HOOK_GOAL_FLASH
-    + _TTS_HOOK_SCOPE_FLASH
+    + _TTS_HOOK_OUTPUT_SCOPE
     + _TTS_HOOK_LANGUAGE
 )
