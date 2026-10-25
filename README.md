@@ -1,212 +1,147 @@
 # hermes-inworld
 
-Hermes Agent voice plugin — Inworld TTS-2 / TTS-2 Flash with manual or opt-in automatic steering on TTS-2, and Inworld Realtime STT with Voice Profile analysis.
-
-## Features
-
-### Text-to-Speech (TTS-2 / TTS-2 Flash)
-- Manual steering tags: `[say excitedly]`, `[very slow]`, `[whisper]`, `[laugh]`,
-  emphasis via `CAPITALISATION`, non-verbals, and combinations like
-  `[say sadly with deliberate pauses in a low voice and hushed style]`.
-  Instruction tags and capitalization emphasis apply to `inworld-tts-2` only;
-  `inworld-tts-2-flash` ignores instruction tags (emphasis is unverified on
-  Flash) but still supports non-verbal sounds.
-- Two models: `inworld-tts-2` (flagship, full steering) and
-  `inworld-tts-2-flash` (lowest latency and cost; instruction tags are ignored,
-  non-verbals still work).
-- Optional automatic steering rewrite: `tts.inworld-tts.steering_rewrite: true`
-  runs the TTS input through a hidden auxiliary LLM pass
-  (`auxiliary.tts_audio_tags`) to add tags before synthesis. Default `false`:
-  text is synthesized as written.
-- Rewrite prompts are composed from shared sections plus optional capability
-  sections. The steering-enabled prompt adds inline delivery directions with
-  `[reset]` persistence and mixed-language spans; the no-steering prompt uses
-  the shared non-verbals, emphasis, pauses, verbatim IDs, IPA, language
-  prefixes, number/abbreviation normalization, mandatory acronym IPA, cleanup,
-  and formatting sections only. Deprecated/unknown model IDs skip the rewrite
-  and log one warning per model.
-- Choose a voice via `tts.inworld-tts.voice` in config (defaults to "Sarah").
-- Optional speaking rate (`speed`) forwarded by Hermes as
-  `audioConfig.speakingRate`.
-- Language override: prefix text with a language name or ISO code in braces,
-  e.g. `{polish}` or `{pl}`. Supported: Arabic, Chinese, Dutch, English, French,
-  German, Hebrew, Hindi, Italian, Japanese, Korean, Polish, Portuguese, Russian,
-  Spanish.
-- Audio formats: mp3, wav, ogg_opus, flac, and linear16. Opus/OGG is available
-  for voice-messaging platforms when `ffmpeg` is on `PATH` (`voice_compatible`).
-- Configurable `delivery_mode` (STABLE / BALANCED / CREATIVE), HTTP timeout, and
-  a retry policy with exponential backoff for 5xx, 429, and network errors.
-
-### Speech-to-Text (STT)
-- Voice marker prefix (default `🎤`, disable with `""`) on transcriptions, plus
-  a first-turn `pre_llm_call` prompt so the agent replies with voice as well.
-- Voice Profile analysis (emotion, pitch, vocal style) when `voice_profile: true`;
-  requires a Voice Profile-capable model (the default `inworld/inworld-stt-1`).
-- Configurable Voice Profile skip keys (defaults to `age`, `gender`, `accent`).
-- Configurable custom vocabulary prompts (e.g. project codenames).
-- STT models: `inworld/inworld-stt-1` (default; Voice Profile support) and
-  `groq/whisper-large-v3` (broad language coverage). The provider accepts the
-  model forwarded by Hermes.
-- Optional language hint forwarded by Hermes; unset or `auto` lets the API
-  auto-detect.
-- Auto-converts unsupported audio (e.g. WEBM from the desktop app) to OGG_OPUS
-  via `ffmpeg`.
-- Configurable HTTP, ffmpeg, and ffprobe timeouts, plus a retry policy with
-  exponential backoff for 5xx and 429 responses and network errors. The
-  pre-existing 500 → AUTO_DETECT encoding fallback is preserved.
-
-### Cross-cutting
-- When `inworld-stt` is the configured STT provider, the `pre_llm_call` hook
-  injects voice-marker / Voice Profile context on the first turn only — no
-  per-turn overhead. The former TTS prompt-injection hook has been removed;
-  use `steering_rewrite` instead.
+Inworld voice plugin for Hermes Agent. Adds Inworld TTS-2 text-to-speech and
+Inworld Realtime speech-to-text, with optional automatic steering tags and
+Voice Profile annotations.
 
 ## Install
 
-Drop this directory into `~/.hermes/plugins/hermes-inworld/`, then enable:
+Requires Python 3.13+ and `ruamel-yaml`. `ffmpeg` is optional: it enables
+Opus/OGG voice output and conversion of unsupported STT audio. `ffprobe`
+improves audio probing for STT.
+
+Copy this directory to `~/.hermes/plugins/hermes-inworld/` and enable it:
 
 ```bash
 hermes plugins enable hermes-inworld
 ```
 
-The plugin requires Python 3.13+. Config support uses `ruamel-yaml` (declared in
-`pyproject.toml`); without it the providers fall back to config-less defaults.
-`ffmpeg` is optional but enables Opus/OGG voice bubbles and STT conversion;
-`ffprobe` improves STT audio probing.
+Restart Hermes after enabling.
 
-## Configure
+## Configuration
 
-### 1. API key (required)
+Set your API key in `~/.hermes/.env` or the environment:
 
-In `~/.hermes/.env`:
-
-```
+```dotenv
 INWORLD_API_KEY=your_key_here
 ```
 
-### 2. Pick the providers in `~/.hermes/config.yaml`
+Add the providers to `~/.hermes/config.yaml`:
 
 ```yaml
 tts:
   provider: inworld-tts
   inworld-tts:
-    steering_rewrite: false   # optional; true = LLM-rewrite the TTS text
-    voice: "Sarah"            # optional; defaults to "Sarah" when unset
-    model: "inworld-tts-2"    # optional; inworld-tts-2 | inworld-tts-2-flash
-    delivery_mode: "CREATIVE" # optional; STABLE | BALANCED | CREATIVE.
-                              # Defaults to CREATIVE (matches the previous
-                              # hardcoded payload value).
-    timeout: 60               # optional; HTTP request timeout (seconds).
-                              # Defaults to 60.
-    retry:                    # optional; per-provider retry policy.
-      max_retries: 3          # additional attempts after the first failure.
-      initial_backoff: 1.0    # seconds; doubled by backoff_multiplier per
-      backoff_multiplier: 2.0 # retry, capped at max_backoff.
-      max_backoff: 30.0
-      retry_on_5xx: true      # retry on server errors (500-599).
-      retry_on_429: true      # retry on rate limit (honors Retry-After).
-      retry_on_network_error: true # retry on URLError / DNS / etc.
-
-stt:
-  provider: inworld-stt
-  inworld-stt:
-    voice_prefix: "🎤"          # default: "🎤"; set "" to disable
-    voice_profile: true         # default: false; append [emotion -> calm:0.85 | ...] suffix
-    voice_profile_skip_keys:    # optional; override the keys stripped from
-      - age                    # the transcript suffix. Defaults to
-      - gender                 # ["age", "gender", "accent"].
-      - accent
-    voice_profile_min_confidence: 0.2  # optional; per-label confidence floor
-                                     # (0.0-1.0). Labels below this
-                                     # threshold are dropped from the
-                                     # transcript suffix. Defaults to 0.2.
-    prompts:                   # optional custom vocabulary
-      - "Hermes"
-    timeouts:                  # optional; per-stage timeouts (seconds).
-      http: 120                # Synchronous STT request timeout.
-      ffmpeg: 120              # Unsupported-format conversion (OGG_OPUS).
-      ffprobe: 10              # Audio probe for sample rate / channels.
-    retry:                     # optional; per-provider retry policy.
+    voice: "Sarah"            # default voice
+    model: "inworld-tts-2"    # or inworld-tts-2-flash
+    steering_rewrite: false   # add steering tags with an auxiliary LLM
+    delivery_mode: "CREATIVE" # STABLE, BALANCED, or CREATIVE
+    timeout: 60               # seconds
+    retry:
       max_retries: 3
       initial_backoff: 1.0
       backoff_multiplier: 2.0
       max_backoff: 30.0
-      retry_on_5xx: true
-      retry_on_429: true
-      retry_on_network_error: true
+
+stt:
+  provider: inworld-stt
+  inworld-stt:
+    voice_prefix: "🎤"        # set "" to disable
+    voice_profile: false      # append voice characteristics to transcripts
+    voice_profile_skip_keys: ["age", "gender", "accent"]
+    voice_profile_min_confidence: 0.2
+    prompts: ["Hermes"]       # optional vocabulary
+    timeouts:
+      http: 120
+      ffmpeg: 120
+      ffprobe: 10
 ```
 
-Provider config blocks are cached per provider instance. Restart Hermes/gateway
-after changing `tts.inworld-tts` or `stt.inworld-stt` settings; the TTS `model`
-key is re-read on each synthesis, so model changes apply without a restart.
+The STT `retry` block accepts the same keys as TTS.
 
-The 500 → AUTO_DETECT encoding fallback in STT is preserved by default
-(the first server-side 500 is followed by a single retry with
-`audioEncoding: AUTO_DETECT`, with the Voice Profile suffix suppressed
-on that path). Set `retry.max_retries: 0` to disable retries entirely.
+## Text-to-speech
 
-### 3. TTS steering rewrite (optional)
+`inworld-tts-2` is the default model and understands instruction tags:
 
-`steering_rewrite` is off by default: normal text goes to TTS with no steering
-tags and no TTS prompt injection.
+```text
+[say excitedly] Great news! [very slow] Let me explain. [reset] That's everything.
+```
 
-Set `tts.inworld-tts.steering_rewrite: true` to have the TTS input rewritten
-by the auxiliary LLM task `tts_audio_tags` before synthesis. The visible chat
-text is unchanged; only the text sent to Inworld is rewritten.
+Non-verbal tags such as `[laugh]`, `[sigh]`, and `[clear throat]` work on both
+models. `inworld-tts-2-flash` is cheaper and faster but ignores instruction
+tags.
 
-- Steering-enabled prompt: inline delivery directions (including `[reset]`
-  for direction persistence), non-verbals, emphasis, pause controls,
-  `<verbatim>` IDs, inline IPA (acronyms are always transcribed with their
-  established reading), `<lang>` tags for complete foreign words and phrases,
-  number/abbreviation normalization, and formatting.
-- No-steering prompt: the shared non-verbals, emphasis, pauses, `<verbatim>`
-  IDs, inline IPA (acronyms are always transcribed with their established
-  reading), language prefixes, number/abbreviation normalization, cleanup, and
-  formatting sections only.
-- Deprecated/unknown model IDs: rewrite is skipped, the original text is
-  synthesized, and one warning per model is logged.
-
-If the auxiliary call fails or returns empty text, the original text is
-synthesized.
-
-Route the auxiliary task to a specific model if needed:
+With `steering_rewrite: true`, each reply is passed through the
+`auxiliary.tts_audio_tags` task, which adds tags automatically. The chat text
+stays unchanged. Route the task to a different model with:
 
 ```yaml
 auxiliary:
   tts_audio_tags:
     provider: auto
     model: ""
+    timeout: 180                # seconds; raise if the rewrite call is slow
+    reasoning_effort: "medium"  # optional; enables thinking for the rewrite
 ```
 
-When enabled, the rewrite adds one auxiliary LLM call per synthesis; route it
-to a fast/cheap model if latency or cost matters.
+- `reasoning_effort` is applied by Hermes to the hidden rewrite call; the
+  plugin never overrides it. Unset or `""` (the default) sends no reasoning
+  setting, so the provider or model default applies — non-thinking on models
+  that require an explicit enable. `none` disables thinking; enabled levels
+  are `minimal`, `low`, `medium`, `high`, `xhigh`, `max`, and `ultra`, and
+  routes clamp levels they do not support.
+- Thinking can improve tag placement but adds latency and token cost on top of
+  the auxiliary call every synthesis already makes. Raise `timeout` (default
+  30 seconds) if the model needs longer; a timed-out rewrite falls back to the
+  original text. A thinking response that returns the script only in a
+  separate reasoning field is also treated as empty, so the original text is
+  spoken.
+- `tts_audio_tags` is shared with Hermes's Gemini and xAI audio-tag rewrites,
+  so this setting affects those paths too.
+- For provider-specific reasoning payloads, set
+  `auxiliary.tts_audio_tags.extra_body.reasoning`; it takes precedence over
+  `reasoning_effort`. Per-task reasoning requires a Hermes version that
+  supports it; older versions ignore the key.
 
-Because the provider config block is cached, changing `steering_rewrite`
-requires a Hermes/gateway restart. When rewrite is enabled, the model is
-resolved and checked on every synthesis, so a model change applies immediately.
+Language can be forced with a prefix: `{polish} Witaj!` or `{pl} Witaj!`.
+Supported languages: arabic, chinese, dutch, english, french, german, hebrew,
+hindi, italian, japanese, korean, polish, portuguese, russian, and spanish.
 
-The legacy first-turn TTS prompt injection has been removed. Set
-`steering_rewrite: true` to restore automatic steering; there is no legacy
-prompt-insertion mode.
+Voice output defaults to MP3. Other formats: `wav`, `ogg_opus`, `flac`, and
+`linear16`; Opus requires `ffmpeg`. `speed` maps to Inworld's speaking rate
+(0.5-1.5).
 
-Current limitation: there is no length guard, so a very long rewrite may exceed
-Inworld's 2,000 UTF-16-unit synchronous request limit.
+## Speech-to-text
 
-### 4. TTS model selection
+Two models are supported: `inworld/inworld-stt-1` (default) and
+`groq/whisper-large-v3`.
 
-Set the model alongside the voice under `tts.inworld-tts` in
-`~/.hermes/config.yaml`. The Hermes TTS picker writes only `tts.provider`,
-so add the `model` key manually.
+`voice_prefix` (default `🎤`) is prepended to every transcript. With
+`voice_profile: true`, detected characteristics are appended:
 
-- Use the exact lowercase IDs shown above. Model matching for the rewrite is
-  case-insensitive, but the configured value is sent to the API unchanged.
-- `tts.inworld-tts.model` takes precedence over a top-level `tts.model`
-  value forwarded by Hermes.
-- When the model is unset, `inworld-tts-2` is used.
-- `inworld-tts-1`, `inworld-tts-1-max`, `inworld-tts-1.5-max`, and
-  `inworld-tts-1.5-mini` are deprecated and no longer offered in the catalog.
-  A configured legacy ID still synthesizes, but skips the steering rewrite and
-  logs one warning per model when rewrite is enabled.
-- Changing the model applies to the next synthesis. When rewrite is enabled,
-  the prompt is selected per synthesis; there is no first-turn context to
-  update.
+```text
+[emotion -> calm:0.85, sad:0.10 | vocalStyle -> normal:0.92]
+```
+
+Labels below `voice_profile_min_confidence` are dropped, as are keys listed in
+`voice_profile_skip_keys` and the `unclear` label. `prompts` adds names or
+terms that should be recognized more reliably.
+
+Audio formats the API does not accept are converted to OGG_OPUS with
+`ffmpeg`. If `ffmpeg` is missing, the original file is sent as-is.
+
+## Retries and timeouts
+
+Both providers retry 5xx, 429, and network errors with exponential backoff and
+respect `Retry-After` on 429. Defaults are 3 retries, starting at 1 second,
+doubling up to 30 seconds. `retry_on_5xx`, `retry_on_429`, and
+`retry_on_network_error` are all enabled. TTS times out after 60 seconds; STT
+uses 120 seconds for HTTP and ffmpeg, and 10 seconds for ffprobe. Set
+`retry.max_retries: 0` to disable retries.
+
+## Troubleshooting
+
+- No audio and API errors: check that `INWORLD_API_KEY` is set.
+- Opus/OGG output or WEBM transcription fails: install `ffmpeg`.
+- Config changes have no effect: restart Hermes.
+- Very long TTS replies fail: keep text under 2,000 UTF-16 code units.
