@@ -1,11 +1,15 @@
 """Shared utilities for the hermes-inworld plugin.
 
-Constants, retry helpers, and config-reader used by both the TTS and STT
-provider modules (see :mod:`.tts` and :mod:`.stt`).
+Constants, retry helpers, the shared HTTP opener, and config-reader used by
+the TTS and STT provider modules (see :mod:`.tts`, :mod:`.stt`, and
+:mod:`._tts_streaming`).
 """
 
+import logging
 import os
-from collections.abc import Iterator
+import time
+import urllib.error
+from collections.abc import Callable, Iterator
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 from typing import Any
@@ -17,7 +21,10 @@ except ImportError:
     _yaml = None  # type: ignore[assignment]
 
 INWORLD_TTS_API_URL = "https://api.inworld.ai/tts/v1/voice"
+INWORLD_TTS_STREAM_API_URL = "https://api.inworld.ai/tts/v1/voice:stream"
 INWORLD_STT_API_URL = "https://api.inworld.ai/stt/v1/transcribe"
+
+logger = logging.getLogger(__name__)
 
 
 def api_key() -> str:
@@ -31,10 +38,11 @@ def api_key() -> str:
 
 
 # ── Retry policy helpers ──────────────────────────────────────────
-# Shared by tts.py and stt.py. Each provider reads its own config
-# section (the ``retry:`` block) and resolves a policy dict; the two
-# transport loops live in their respective modules so the error
-# contracts (TTS raises, STT returns envelope) stay separate.
+# Shared by tts.py, _tts_streaming.py, and stt.py. Each provider reads
+# its own config section (the ``retry:`` block) and resolves a policy
+# dict. TTS sync synthesis and TTS streaming share ``open_with_retries``
+# below; STT keeps its own loop in stt.py because its AUTO_DETECT
+# fallback and result-envelope error contract are different.
 
 
 def is_retryable_http_status(code: int, retry_on_5xx: bool, retry_on_429: bool) -> bool:
@@ -249,6 +257,73 @@ def compute_retry_delay(
         policy["backoff_multiplier"],
         policy["max_backoff"],
     )
+
+
+def open_with_retries(
+    open_request: Callable[[], Any],
+    policy: dict[str, Any],
+    *,
+    service: str = "Inworld TTS",
+    log: logging.Logger | None = None,
+) -> Any:
+    """Open an HTTP request, retrying transient failures per ``policy``.
+
+    ``open_request`` is called once per attempt and must perform only the
+    open (for example ``urllib.request.urlopen``); reading and decoding
+    stay with the caller. 5xx/429 responses are retried when the policy
+    enables them, network errors are retried when
+    ``retry_on_network_error`` is set, and a server ``Retry-After`` header
+    wins over the policy's exponential backoff. ``service`` prefixes the
+    warning lines and ``log`` selects the caller's module logger.
+
+    This helper never wraps or replaces the final failure: the last
+    ``HTTPError``/``URLError`` is re-raised untouched so callers can keep
+    their own ``RuntimeError`` wording and ``from e`` chaining.
+    """
+    target_log = log if log is not None else logger
+    for attempt in range(policy["max_retries"] + 1):
+        try:
+            return open_request()
+        except urllib.error.HTTPError as e:
+            if not is_retryable_http_status(
+                e.code, policy["retry_on_5xx"], policy["retry_on_429"]
+            ):
+                raise
+            if attempt >= policy["max_retries"]:
+                raise
+            backoff = compute_retry_delay(e, attempt, policy)
+            target_log.warning(
+                "%s HTTP %d — retry %d/%d in %.1fs",
+                service,
+                e.code,
+                attempt + 1,
+                policy["max_retries"],
+                backoff,
+            )
+            time.sleep(backoff)
+        except urllib.error.URLError as e:
+            if not policy["retry_on_network_error"]:
+                raise
+            if attempt >= policy["max_retries"]:
+                raise
+            backoff = compute_retry_backoff(
+                attempt,
+                policy["initial_backoff"],
+                policy["backoff_multiplier"],
+                policy["max_backoff"],
+            )
+            target_log.warning(
+                "%s network error (%s) — retry %d/%d in %.1fs",
+                service,
+                e.reason,
+                attempt + 1,
+                policy["max_retries"],
+                backoff,
+            )
+            time.sleep(backoff)
+    # Unreachable: the loop returns on success or re-raises on the final
+    # attempt. Defensive raise to keep the type checker happy.
+    raise RuntimeError(f"{service} retry loop exited unexpectedly")
 
 
 # Defaults for the per-provider ``retry:`` config block. Each provider

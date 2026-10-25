@@ -35,6 +35,7 @@ tts:
     voice: "Sarah"            # default voice
     model: "inworld-tts-2"    # or inworld-tts-2-flash
     steering_rewrite: false   # add steering tags with an auxiliary LLM
+    streaming_extra_body: {}  # native reasoning-disable fields for streamed rewrites
     delivery_mode: "CREATIVE" # STABLE, BALANCED, or CREATIVE
     timeout: 60               # seconds
     retry:                    # TTS HTTP requests and the steering rewrite
@@ -84,12 +85,28 @@ auxiliary:
     reasoning_effort: "medium"  # optional; enables thinking for the rewrite
 ```
 
-- `reasoning_effort` is applied by Hermes to the hidden rewrite call; the
+- `reasoning_effort` is applied by Hermes to the hidden sync rewrite call; the
   plugin never overrides it. Unset or `""` (the default) sends no reasoning
   setting, so the provider or model default applies — non-thinking on models
   that require an explicit enable. `none` disables thinking; enabled levels
   are `minimal`, `low`, `medium`, `high`, `xhigh`, `max`, and `ultra`, and
   routes clamp levels they do not support.
+- Streamed rewrites request thinking off. Explicit vendor reasoning keys in
+  `extra_body` remain user-authoritative, and Hermes may lift the disable to
+  its reasoning floor on routes that cannot disable reasoning.
+- If a custom/OpenAI-compatible route (for example LiteLLM) ignores Hermes'
+  `reasoning_effort: "none"` disable, add the provider's native off switch to
+  `tts.inworld-tts.streaming_extra_body`. It is merged only into streamed
+  rewrites, so the sync rewrite keeps following `reasoning_effort`:
+  ```yaml
+  tts:
+    inworld-tts:
+      streaming_extra_body:
+        thinking:
+          type: disabled   # DeepSeek V4 through LiteLLM
+  ```
+  Use the key the route actually understands; unknown keys can make the
+  rewrite fail, in which case the original text is spoken.
 - Thinking can improve tag placement but adds latency and token cost on top of
   the auxiliary call every synthesis already makes. Raise `timeout` (default
   30 seconds) if the model needs longer; a timed-out rewrite falls back to the
@@ -102,6 +119,8 @@ auxiliary:
   `auxiliary.tts_audio_tags.extra_body.reasoning`; it takes precedence over
   `reasoning_effort`. Per-task reasoning requires a Hermes version that
   supports it; older versions ignore the key.
+- `streaming_extra_body` is passed to Hermes as `extra_body` on the streaming
+  rewrite only. It does not affect sync synthesis or non-streaming calls.
 
 Language can be forced with a prefix: `{polish} Witaj!` or `{pl} Witaj!`.
 Supported languages: arabic, chinese, dutch, english, french, german, hebrew,
@@ -110,6 +129,13 @@ hindi, italian, japanese, korean, polish, portuguese, russian, and spanish.
 Voice output defaults to MP3. Other formats: `wav`, `ogg_opus`, `flac`, and
 `linear16`; Opus requires `ffmpeg`. `speed` maps to Inworld's speaking rate
 (0.5-1.5).
+
+Hermes's streaming voice surfaces use the plugin automatically when
+`inworld-tts` is the provider, playing 24 kHz PCM16LE sentence by sentence
+before the reply finishes. Each chunk is a separate request capped at 4,000
+UTF-16 code units, so steering is limited to one short delivery direction per
+chunk with no `[reset]`; flash remains direction-free. `tts.streaming.provider`
+can pin a different streamer; under `auto`, built-in streamers are tried first.
 
 ## Speech-to-text
 
@@ -138,7 +164,9 @@ The TTS HTTP call, the optional TTS steering rewrite, and STT HTTP calls retry
 up to 30 seconds. `retry_on_5xx`, `retry_on_429`, and
 `retry_on_network_error` are all enabled. TTS times out after 60 seconds; STT
 uses 120 seconds for HTTP and ffmpeg, and 10 seconds for ffprobe. Set
-`retry.max_retries: 0` to disable retries.
+`retry.max_retries: 0` to disable retries. Streaming retries only the initial
+HTTP open; once audio has been yielded, a mid-stream failure raises without a
+retry.
 
 The steering rewrite is an auxiliary LLM call, so it is also subject to
 Hermes's `auxiliary.transient_retries` and provider fallback.
@@ -156,4 +184,9 @@ non-429 4xx/auth errors or empty rewrite responses.
 - No audio and API errors: check that `INWORLD_API_KEY` is set.
 - Opus/OGG output or WEBM transcription fails: install `ffmpeg`.
 - Config changes have no effect: restart Hermes.
-- Very long TTS replies fail: keep text under 2,000 UTF-16 code units.
+- Very long TTS replies fail: keep text under 2,000 UTF-16 code units for sync
+  synthesis. Streaming handles up to 4,000 UTF-16 code units per sentence
+  chunk; oversized chunks are truncated.
+- Streaming audio is missing or falls back to whole-file synthesis: confirm
+  Hermes supports plugin PCM streaming, that `tts.provider` is `inworld-tts`,
+  and that `tts.streaming.provider` is not pinned to a different streamer.

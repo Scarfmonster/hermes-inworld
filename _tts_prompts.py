@@ -3,14 +3,23 @@
 These prompts are sent to the auxiliary LLM (task ``tts_audio_tags``) when
 ``tts.inworld-tts.steering_rewrite`` is enabled.
 
-Both prompts are assembled from the same shared sections. Optional capability
+All prompts are assembled from the same shared sections. Optional capability
 sections are added only when the selected engine supports them: inline
 delivery directions and mixed-language spans. Examples live inside the
-section they illustrate. ``TTS_REWRITE_PROMPT`` includes both optional
-sections; ``TTS_REDUCED_REWRITE_PROMPT`` uses the shared sections only.
+section they illustrate. ``TTS_REWRITE_PROMPT`` (sync TTS-2) includes both
+optional sections; ``TTS_REDUCED_REWRITE_PROMPT`` (sync Flash) uses the
+shared sections only. ``TTS_STREAMING_REWRITE_PROMPT`` and
+``TTS_STREAMING_REDUCED_REWRITE_PROMPT`` are their streaming counterparts:
+each request carries one sentence chunk, so their delivery section allows at
+most one short direction per chunk (and Flash remains direction-free).
 """
 
-__all__ = ("TTS_REDUCED_REWRITE_PROMPT", "TTS_REWRITE_PROMPT")
+__all__ = (
+    "TTS_REDUCED_REWRITE_PROMPT",
+    "TTS_REWRITE_PROMPT",
+    "TTS_STREAMING_REDUCED_REWRITE_PROMPT",
+    "TTS_STREAMING_REWRITE_PROMPT",
+)
 
 _ROLE = """## Speech-ready transcript rewrite
 
@@ -26,6 +35,11 @@ _REWRITE_RULES = """### Rewrite rules
 - Use only the inline markup described below. Never output markdown, HTML, XML other than the documented tags, emojis, or decorative symbols.
 - Preserve any valid inline markup described below unless it conflicts with these rules; do not duplicate tags. Remove any bracketed text that is not a valid inline tag; if it carries meaning, rewrite that meaning as spoken words.
 - The engine accepts 2,000 UTF-16 code units per request, and all markup and spoken-form expansions count toward that limit. If the transcript is long, use fewer tags rather than cutting words; if it is near the limit, add no optional markup.
+
+"""
+
+_STREAMING_SENTENCE_RULES = """### Streamed sentence chunk
+This request contains one streamed sentence chunk: normally one sentence, though very short fragments may be merged into the same chunk. Plan only for this chunk, not for a passage or the whole reply. The rewrite, non-verbal, emphasis, pacing, pronunciation, and spoken-form normalization rules below still apply.
 
 """
 
@@ -62,20 +76,52 @@ Output: The meeting moved to three.
 
 """
 
-_NON_VERBALS = """### Non-verbal sounds
+_STREAMING_DELIVERY_DIRECTIONS = """### Inline delivery directions
+The voice engine interprets a bracketed direction as a performance instruction: it is removed from the audio, and the words that follow are performed that way. Write directions in English, lowercase, without punctuation or capital letters inside the brackets.
+
+- Use at most one short direction per streamed sentence chunk. Name one clear quality, such as emotion, articulation, volume, pitch, pace, or style. If the chunk contains several short sentences, still use only one direction total.
+- Place the direction at the start of the chunk after any language prefix, or immediately before the phrase whose delivery changes when the change is local to the chunk. A direction persists to the end of the chunk, so place it where the intended delivery should begin.
+- Default to no direction for neutral, factual, or very short chunks. Never force a direction; the configured voice already supplies its character.
+- Match the direction to the chunk content, and never put a conflicting direction on it.
+- Keep it short: never use long, layered descriptions, and never use more than one direction or a sequence of directions.
+- Do not describe the voice's overall character or persona; the configured voice already supplies it.
+- Keep directions in English even when the spoken text is in another language.
+- If the source chunk already contains directions, keep at most one short delivery direction: replace a long or layered one with a short equivalent, or remove it. Non-verbal tags are separate and may remain.
+- Non-verbal sounds insert a sound and are not directions; they do not change the delivery. Note that `[shout]`, `[scream]`, `[sing]`, `[hum]`, and `[mumble]` are directions, not sounds.
+- Use square brackets only for the one direction or a recognized non-verbal sound; any other bracketed text is treated as an instruction and is not spoken as written.
+
+Input/output examples:
+Input: I need a minute.
+Output: [say sadly] I need a minute.
+
+Input: I can't believe you did that.
+Output: [say with force] I can't believe you did that.
+
+Input: The meeting moved to three.
+Output: The meeting moved to three.
+
+"""
+
+_NON_VERBALS_INTRO = """### Non-verbal sounds
 Use a recognized sound wherever the transcript implies a natural human sound—laughter, a sigh, a breath, throat clearing, a cough, or a yawn. The most reliable are `[laugh]`, `[sigh]`, `[breathe]`, `[clear throat]`, `[cough]`, and `[yawn]`. Do not skip a clear opportunity. Place the tag exactly where the sound occurs, including mid-sentence and later in the script; do not confine non-verbals to the beginning or end. Each tag produces one occurrence and does not change how the surrounding words are spoken. Aim for one or two in a conversational reply when the content supports them; use more in a highly expressive reply. Never force a sound that the content does not support or invent one that contradicts it.
 
 Examples:
 Input: I told him what happened, and he couldn't believe it.
 Output: I told him what happened, and he couldn't believe it. [laugh]
 
-Input: We lost the contract. I need a minute.
+"""
+
+_NON_VERBALS_SYNC_EXAMPLE = """Input: We lost the contract. I need a minute.
 Output: [say sadly with a low tone and slow pace] We lost the contract. [sigh] I need a minute.
 
-Input: I was so relieved I could barely speak.
+"""
+
+_NON_VERBALS_OUTRO = """Input: I was so relieved I could barely speak.
 Output: I was so relieved I could barely [breathe] speak.
 
 """
+
+_NON_VERBALS = _NON_VERBALS_INTRO + _NON_VERBALS_SYNC_EXAMPLE + _NON_VERBALS_OUTRO
 
 _WORD_EMPHASIS = """### Word emphasis
 Stress a word by capitalizing the whole word (`I told you NOT to do that`) or a syllable by capitalizing its letters (`AbsoLUTEly`). You can also wrap a single word in single asterisks (`*really*`). Use emphasis at most once or twice per script, on the word the listener must catch. Never use double asterisks, underscores, or other markdown. Outside `<verbatim>` tags, use asterisks only for emphasis, not as symbols or separators. Do not use existing capitalization in acronyms, names, or code identifiers as emphasis, and do not alter it just to add emphasis.
@@ -184,23 +230,43 @@ Return only the final speech script. Do not wrap it in fences, quotes, or labels
 """
 
 
+def _non_verbals(*, streaming: bool, include_direction: bool) -> str:
+    """Return the non-verbal section for a sync or streaming rewrite prompt.
+
+    The sync section is returned unchanged. Streaming uses a single-sentence
+    second example; ``include_direction`` controls whether that example shows
+    the one short delivery direction (TTS-2) or omits it (Flash).
+    """
+    if not streaming:
+        return _NON_VERBALS
+    output = "[say sadly] I need a minute." if include_direction else "I need a minute."
+    streaming_example = f"Input: I need a minute.\nOutput: {output}\n\n"
+    return _NON_VERBALS_INTRO + streaming_example + _NON_VERBALS_OUTRO
+
+
 def _compose_prompt(
     *,
+    sentence_rules: str = "",
     delivery_directions: str = "",
+    non_verbals: str | None = None,
     mixed_language_spans: str = "",
 ) -> str:
     """Compose a prompt from shared sections and optional capability sections.
 
-    ``delivery_directions`` is included only for engines that support inline
-    performance directions. ``mixed_language_spans`` is included only for
-    engines that support inline language tags.
+    ``sentence_rules`` is inserted after the shared rewrite rules and is used
+    by the streaming variants. ``delivery_directions`` is included only for
+    engines that support inline performance directions.
+    ``non_verbals`` defaults to the sync non-verbal section.
+    ``mixed_language_spans`` is included only for engines that support inline
+    language tags.
     """
     return "".join(
         (
             _ROLE,
             _REWRITE_RULES,
+            sentence_rules,
             delivery_directions,
-            _NON_VERBALS,
+            _NON_VERBALS if non_verbals is None else non_verbals,
             _WORD_EMPHASIS,
             _PAUSES_AND_PACING,
             _EXACT_ALPHANUMERIC_STRINGS,
@@ -214,9 +280,33 @@ def _compose_prompt(
     )
 
 
-TTS_REWRITE_PROMPT = _compose_prompt(
-    delivery_directions=_INLINE_DELIVERY_DIRECTIONS,
-    mixed_language_spans=_MIXED_LANGUAGE_SPANS,
-)
+def _build_rewrite_prompt(*, steering: bool, streaming: bool) -> str:
+    """Build the rewrite prompt for a model capability and transport mode.
 
-TTS_REDUCED_REWRITE_PROMPT = _compose_prompt()
+    ``steering`` selects the delivery-direction and mixed-language sections;
+    ``streaming`` swaps in the sentence-chunk rules and the compact delivery
+    section, and switches the non-verbal example to a single sentence.
+    """
+    if streaming and steering:
+        delivery_directions = _STREAMING_DELIVERY_DIRECTIONS
+    elif steering:
+        delivery_directions = _INLINE_DELIVERY_DIRECTIONS
+    else:
+        delivery_directions = ""
+    return _compose_prompt(
+        sentence_rules=_STREAMING_SENTENCE_RULES if streaming else "",
+        delivery_directions=delivery_directions,
+        non_verbals=_non_verbals(
+            streaming=streaming,
+            include_direction=(not streaming or steering),
+        ),
+        mixed_language_spans=_MIXED_LANGUAGE_SPANS if steering else "",
+    )
+
+
+TTS_REWRITE_PROMPT = _build_rewrite_prompt(steering=True, streaming=False)
+TTS_REDUCED_REWRITE_PROMPT = _build_rewrite_prompt(steering=False, streaming=False)
+TTS_STREAMING_REWRITE_PROMPT = _build_rewrite_prompt(steering=True, streaming=True)
+TTS_STREAMING_REDUCED_REWRITE_PROMPT = _build_rewrite_prompt(
+    steering=False, streaming=True
+)

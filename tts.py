@@ -10,11 +10,20 @@ When ``tts.inworld-tts.steering_rewrite`` is enabled, the text is first
 rewritten by an auxiliary LLM (task ``tts_audio_tags``) to add expressive
 tags and formatting appropriate to the resolved model before synthesis. The
 legacy first-turn ``pre_llm_call`` prompt injection has been removed.
+
+The provider also opts into Hermes' raw-PCM streaming path
+(``streams_pcm``/``stream_sample_rate``). ``stream()`` serves one sentence
+chunk per request over Inworld's HTTP streaming endpoint, rewriting each
+chunk with thinking off when steering rewrite is enabled.
+``tts.inworld-tts.streaming_extra_body`` can add a provider-native
+reasoning-disable key for custom routes that ignore Hermes' abstract
+reasoning config.
 """
 
 from __future__ import annotations
 
 import base64
+import copy
 import json
 import logging
 import os
@@ -23,6 +32,7 @@ import shutil
 import time
 import urllib.error
 import urllib.request
+from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
@@ -32,14 +42,25 @@ from ._common import (
     INWORLD_TTS_API_URL,
     RETRY_POLICY_DEFAULTS,
     api_key,
-    compute_retry_backoff,
     compute_retry_delay,
-    is_retryable_http_status,
     is_retryable_llm_error,
-    parse_retry_after_seconds,
+    open_with_retries,
     read_hermes_config,
 )
-from ._tts_prompts import TTS_REDUCED_REWRITE_PROMPT, TTS_REWRITE_PROMPT
+from ._tts_prompts import (
+    TTS_REDUCED_REWRITE_PROMPT,
+    TTS_REWRITE_PROMPT,
+    TTS_STREAMING_REDUCED_REWRITE_PROMPT,
+    TTS_STREAMING_REWRITE_PROMPT,
+)
+from ._tts_streaming import (
+    STREAM_MAX_UTF16_UNITS,
+    STREAM_REWRITE_REASONING_CONFIG,
+    STREAM_SAMPLE_RATE,
+    stream_synthesis,
+    truncate_utf16,
+    utf16_len,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -223,10 +244,28 @@ def _clean_rewrite_output(content: str) -> str:
     return fence.group(1).strip() if fence else clean
 
 
-def _call_llm_rewrite(transcript: str, system_prompt: str) -> str:
-    """Make one auxiliary LLM rewrite attempt and return cleaned content."""
+def _call_llm_rewrite(
+    transcript: str,
+    system_prompt: str,
+    *,
+    reasoning_config: dict[str, Any] | None = None,
+    extra_body: dict[str, Any] | None = None,
+) -> str:
+    """Make one auxiliary LLM rewrite attempt and return cleaned content.
+
+    ``reasoning_config`` is forwarded only when provided so sync synthesis
+    keeps deferring to Hermes' ``auxiliary.tts_audio_tags.reasoning_effort``.
+    ``extra_body`` is also forwarded only when provided; streaming uses it for
+    a provider-native reasoning-disable key that Hermes' abstract
+    ``reasoning_config`` cannot express on custom routes.
+    """
     from agent.auxiliary_client import call_llm
 
+    kwargs: dict[str, Any] = {}
+    if reasoning_config is not None:
+        kwargs["reasoning_config"] = reasoning_config
+    if extra_body:
+        kwargs["extra_body"] = copy.deepcopy(extra_body)
     response = call_llm(
         task=_TTS_REWRITE_TASK,
         messages=[
@@ -234,24 +273,38 @@ def _call_llm_rewrite(transcript: str, system_prompt: str) -> str:
             {"role": "user", "content": f"TRANSCRIPT TO REWRITE:\n{transcript}"},
         ],
         temperature=_TTS_REWRITE_TEMPERATURE,
+        **kwargs,
     )
     return _clean_rewrite_output(_extract_auxiliary_message_content(response))
 
 
-def _rewrite_tts_text(text: str, system_prompt: str, policy: dict[str, Any]) -> str:
+def _rewrite_tts_text(
+    text: str,
+    system_prompt: str,
+    policy: dict[str, Any],
+    *,
+    reasoning_config: dict[str, Any] | None = None,
+    extra_body: dict[str, Any] | None = None,
+) -> str:
     """Rewrite ``text`` with the auxiliary LLM, retrying transient failures.
 
     Retries follow ``policy`` (the shared TTS ``retry`` block) and fall
     back to the original text once the policy is exhausted or a
     non-transient error occurs. Only ``Exception`` is caught so
-    cancellation signals propagate.
+    cancellation signals propagate. ``reasoning_config`` and
+    ``extra_body`` are forwarded to each attempt when provided.
     """
     transcript = text.strip()
     if not transcript:
         return text
     for attempt in range(policy["max_retries"] + 1):
         try:
-            rewritten = _call_llm_rewrite(transcript, system_prompt)
+            rewritten = _call_llm_rewrite(
+                transcript,
+                system_prompt,
+                reasoning_config=reasoning_config,
+                extra_body=extra_body,
+            )
         except Exception as exc:
             is_last_attempt = attempt >= policy["max_retries"]
             if is_last_attempt or not is_retryable_llm_error(exc, policy):
@@ -283,22 +336,88 @@ def _rewrite_tts_text(text: str, system_prompt: str, policy: dict[str, Any]) -> 
     return text
 
 
-def _rewrite_prompt_for_model(model_id: str | None) -> str | None:
-    """Return the rewrite prompt for ``model_id``, or ``None`` to skip."""
+def _rewrite_prompt_for_model(
+    model_id: str | None, *, streaming: bool = False
+) -> str | None:
+    """Return the rewrite prompt for ``model_id``, or ``None`` to skip.
+
+    ``streaming`` selects the sentence-chunk prompt variants; TTS-2 keeps its
+    one-short-direction section, while Flash stays direction-free.
+    """
     if _supports_inworld_steering(model_id):
-        return TTS_REWRITE_PROMPT
+        return TTS_STREAMING_REWRITE_PROMPT if streaming else TTS_REWRITE_PROMPT
     if _is_inworld_flash_model(model_id):
-        return TTS_REDUCED_REWRITE_PROMPT
+        return (
+            TTS_STREAMING_REDUCED_REWRITE_PROMPT
+            if streaming
+            else TTS_REDUCED_REWRITE_PROMPT
+        )
     return None
 
 
-def _apply_steering_rewrite(text: str, model_id: str, policy: dict[str, Any]) -> str:
-    """Rewrite text for the resolved model, or return it unchanged."""
-    rewrite_prompt = _rewrite_prompt_for_model(model_id)
+def _apply_steering_rewrite(
+    text: str,
+    model_id: str,
+    policy: dict[str, Any],
+    *,
+    streaming: bool = False,
+    reasoning_config: dict[str, Any] | None = None,
+    extra_body: dict[str, Any] | None = None,
+    max_utf16: int | None = None,
+) -> str:
+    """Rewrite text for the resolved model, or return it unchanged.
+
+    ``streaming`` selects the streaming prompt, ``reasoning_config`` is
+    forwarded to the auxiliary call, and ``extra_body`` supplies optional
+    provider-native request fields (such as a reasoning-disable toggle)
+    only for streamed rewrites. When ``max_utf16`` is set and the rewrite
+    exceeds that many UTF-16 units, the original text is returned instead
+    of cutting tags or words.
+    """
+    rewrite_prompt = _rewrite_prompt_for_model(model_id, streaming=streaming)
     if rewrite_prompt is None:
         _warn_tts_rewrite_skipped_once(model_id)
         return text
-    return _rewrite_tts_text(text, rewrite_prompt, policy)
+    rewritten = _rewrite_tts_text(
+        text,
+        rewrite_prompt,
+        policy,
+        reasoning_config=reasoning_config,
+        extra_body=extra_body,
+    )
+    if max_utf16 is not None and utf16_len(rewritten) > max_utf16:
+        logger.warning(
+            "Inworld TTS rewrite exceeded the %d UTF-16 unit streaming limit; "
+            "using original text.",
+            max_utf16,
+        )
+        return text
+    return rewritten
+
+
+def _build_audio_config(
+    *,
+    streaming: bool,
+    output_format: str,
+    speed: float | None,
+) -> dict[str, Any]:
+    """Build the ``audioConfig`` block for a sync or streaming request.
+
+    Sync synthesis maps ``output_format`` to an Inworld encoding (MP3 by
+    default). Streaming always requests headerless 24 kHz PCM16LE; both
+    paths share the same sample rate.
+    """
+    if streaming:
+        audio_encoding = "PCM"
+    else:
+        audio_encoding = _FORMAT_TO_ENCODING.get(output_format.upper(), "MP3")
+    audio_config: dict[str, Any] = {
+        "audioEncoding": audio_encoding,
+        "sampleRateHertz": STREAM_SAMPLE_RATE,
+    }
+    if speed is not None and speed > 0:
+        audio_config["speakingRate"] = speed
+    return audio_config
 
 
 def _build_synthesis_payload(
@@ -308,13 +427,19 @@ def _build_synthesis_payload(
     speed: float | None,
     output_format: str,
     delivery_mode: str = _DEFAULT_DELIVERY_MODE,
+    *,
+    streaming: bool = False,
 ) -> dict[str, Any]:
-    """Build the request payload for the synchronous TTS endpoint.
+    """Build the request payload for the Inworld TTS endpoint.
 
     Performs language-prefix extraction (``{polish} Witaj!``) and returns
     the request dict. ``speakingRate`` lives inside ``audioConfig`` per
     the documented Inworld v1AudioConfig schema. Note: voice outputs may
     differ from earlier placements of this field at non-1.0 speeds.
+
+    ``streaming`` selects headerless PCM at :data:`STREAM_SAMPLE_RATE`
+    and ignores ``output_format``; the sync path keeps the format mapping
+    with MP3 as the default.
     """
     # Extract language override from text prefix
     # e.g. "{polish} Witaj!" → text="Witaj!", language="pl"
@@ -324,10 +449,11 @@ def _build_synthesis_payload(
         "modelId": model_id,
         "voiceId": voice_id,
         "text": text,
-        "audioConfig": {
-            "audioEncoding": "MP3",
-            "sampleRateHertz": 24000,
-        },
+        "audioConfig": _build_audio_config(
+            streaming=streaming,
+            output_format=output_format,
+            speed=speed,
+        ),
         "deliveryMode": delivery_mode,
         "applyTextNormalization": "ON",
     }
@@ -336,26 +462,16 @@ def _build_synthesis_payload(
     if lang_code:
         payload["language"] = lang_code
 
-    # Add speed if overridden — placed inside ``audioConfig`` per the
-    # current Inworld v1AudioConfig schema.
-    if speed is not None and speed > 0:
-        payload["audioConfig"]["speakingRate"] = speed
-
-    # Map format string to Inworld's encoding
-    format_upper = output_format.upper()
-    payload["audioConfig"]["audioEncoding"] = _FORMAT_TO_ENCODING.get(
-        format_upper, "MP3"
-    )
-
     return payload
 
 
 def _open_synthesis_request(payload: dict[str, Any], key: str, timeout: float | int):
     """Open the synchronous TTS endpoint with the given payload + key.
 
-    No retry — that lives in ``InworldTTSProvider._synthesize_with_retries``.
-    HTTP/URL translation stays in the caller so the original RuntimeError
-    messages and ``from e`` chaining are preserved.
+    No retry here — that lives in ``InworldTTSProvider._synthesize_with_retries``
+    (via ``_common.open_with_retries``). HTTP/URL translation stays in the
+    caller so the original RuntimeError messages and ``from e`` chaining are
+    preserved.
     """
     req = urllib.request.Request(
         INWORLD_TTS_API_URL,
@@ -396,7 +512,13 @@ def _decode_synthesis_response(response) -> bytes:
 
 
 class InworldTTSProvider(TTSProvider):
-    """Inworld TTS-2 provider with optional LLM steering rewrite."""
+    """Inworld TTS-2 provider with optional LLM steering rewrite.
+
+    Opts into Hermes' raw-PCM streaming path; see :meth:`stream`.
+    """
+
+    streams_pcm = True
+    stream_sample_rate = STREAM_SAMPLE_RATE
 
     @property
     def name(self) -> str:
@@ -516,6 +638,31 @@ class InworldTTSProvider(TTSProvider):
             return raw.strip().lower() in {"1", "true", "yes", "on"}
         return bool(raw)
 
+    def _streaming_extra_body_config(self) -> dict[str, Any] | None:
+        """Return optional provider-native fields for streamed rewrites.
+
+        Reads ``tts.inworld-tts.streaming_extra_body`` (default unset) and
+        returns a deep copy, or ``None`` when unset/invalid/empty. The
+        mapping is merged into the auxiliary LLM request only for the
+        per-sentence streaming rewrite; sync synthesis stays unaffected.
+        This lets a provider-native reasoning-disable key (for example
+        DeepSeek's ``thinking: {type: disabled}``) override routes that
+        ignore Hermes' abstract ``reasoning_config`` disable.
+        """
+        cfg = self._get_provider_config()
+        raw = cfg.get("streaming_extra_body")
+        if raw is None:
+            return None
+        if not isinstance(raw, dict):
+            logger.warning(
+                "Ignoring tts.inworld-tts.streaming_extra_body=%r; expected a mapping.",
+                raw,
+            )
+            return None
+        if not raw:
+            return None
+        return copy.deepcopy(raw)
+
     def _tts_timeout_config(self) -> int:
         """Return the HTTP request timeout (seconds) for TTS.
 
@@ -593,66 +740,16 @@ class InworldTTSProvider(TTSProvider):
     ):
         """Open the TTS endpoint, retrying transient errors per policy.
 
-        The helper raises the last ``HTTPError``/``URLError`` when the
-        policy is exhausted so ``synthesize`` can preserve the original
-        ``from e`` chaining and RuntimeError wording.
+        Delegates to the shared ``_common.open_with_retries`` helper, which
+        re-raises the last ``HTTPError``/``URLError`` when the policy is
+        exhausted so ``synthesize`` can preserve the original ``from e``
+        chaining and RuntimeError wording.
         """
-        last_error: Exception | None = None
-        for attempt in range(policy["max_retries"] + 1):
-            try:
-                return _open_synthesis_request(payload, key, timeout)
-            except urllib.error.HTTPError as e:
-                last_error = e
-                if not is_retryable_http_status(
-                    e.code, policy["retry_on_5xx"], policy["retry_on_429"]
-                ):
-                    raise
-                if attempt >= policy["max_retries"]:
-                    raise
-                retry_after = parse_retry_after_seconds(e)
-                backoff = (
-                    retry_after
-                    if retry_after is not None
-                    else compute_retry_backoff(
-                        attempt,
-                        policy["initial_backoff"],
-                        policy["backoff_multiplier"],
-                        policy["max_backoff"],
-                    )
-                )
-                logger.warning(
-                    "Inworld TTS HTTP %d — retry %d/%d in %.1fs",
-                    e.code,
-                    attempt + 1,
-                    policy["max_retries"],
-                    backoff,
-                )
-                time.sleep(backoff)
-            except urllib.error.URLError as e:
-                last_error = e
-                if not policy["retry_on_network_error"]:
-                    raise
-                if attempt >= policy["max_retries"]:
-                    raise
-                backoff = compute_retry_backoff(
-                    attempt,
-                    policy["initial_backoff"],
-                    policy["backoff_multiplier"],
-                    policy["max_backoff"],
-                )
-                logger.warning(
-                    "Inworld TTS network error (%s) — retry %d/%d in %.1fs",
-                    e.reason,
-                    attempt + 1,
-                    policy["max_retries"],
-                    backoff,
-                )
-                time.sleep(backoff)
-        # Unreachable: the loop returns on success or re-raises on the
-        # final attempt. Defensive raise to keep the type checker happy.
-        if last_error is not None:
-            raise last_error
-        raise RuntimeError("Inworld TTS retry loop exited unexpectedly")
+        return open_with_retries(
+            lambda: _open_synthesis_request(payload, key, timeout),
+            policy,
+            log=logger,
+        )
 
     def synthesize(
         self,
@@ -723,6 +820,78 @@ class InworldTTSProvider(TTSProvider):
             f.write(audio_bytes)
 
         return output_path
+
+    def stream(
+        self,
+        text: str,
+        *,
+        voice: str | None = None,
+        model: str | None = None,
+        speed: float | None = None,
+        format: str = "pcm",
+        **extra,
+    ) -> Iterator[bytes]:
+        """Stream raw PCM for one sentence chunk over Inworld's HTTP stream.
+
+        Yields headerless int16 little-endian mono PCM at
+        ``stream_sample_rate`` (24,000 Hz). Only ``format="pcm"`` is
+        supported; any other format raises ``NotImplementedError``.
+
+        Each call is independent and may run concurrently for consecutive
+        chunks (Hermes prefetches up to three), so all state is local. When
+        ``tts.inworld-tts.steering_rewrite`` is enabled, the chunk is
+        rewritten with the streaming prompt and thinking disabled.
+        ``tts.inworld-tts.streaming_extra_body`` can add a provider-native
+        disable key for routes that ignore Hermes' abstract reasoning
+        config. A rewrite that fails, returns nothing, or exceeds the 4,000
+        UTF-16 unit cap falls back to the original (truncated) text.
+
+        This is a generator: format validation, config lookup, the rewrite,
+        and the request open happen on the first ``next()``, inside Hermes'
+        prefetch thread. Blank or language-prefix-only chunks return without
+        resolving credentials or issuing a request.
+        """
+        if format.strip().lower() != "pcm":
+            raise NotImplementedError(
+                f"Inworld TTS streaming supports only PCM output, not {format!r}."
+            )
+
+        truncated = truncate_utf16(text, STREAM_MAX_UTF16_UNITS)
+        if not truncated.strip():
+            return
+        if not _extract_language(truncated)[0].strip():
+            return
+
+        key = api_key()
+        voice_id = voice or self._voice_config()
+        model_id = self._configured_model(model)
+        retry_policy = self._retry_policy_config()
+        if self._steering_rewrite_config():
+            truncated = _apply_steering_rewrite(
+                truncated,
+                model_id,
+                retry_policy,
+                streaming=True,
+                reasoning_config=dict(STREAM_REWRITE_REASONING_CONFIG),
+                extra_body=self._streaming_extra_body_config(),
+                max_utf16=STREAM_MAX_UTF16_UNITS,
+            )
+        delivery_mode = self._delivery_mode_config()
+        timeout = self._tts_timeout_config()
+
+        payload = _build_synthesis_payload(
+            truncated,
+            voice_id,
+            model_id,
+            speed,
+            "pcm",
+            delivery_mode,
+            streaming=True,
+        )
+        if not payload["text"].strip():
+            return
+
+        yield from stream_synthesis(payload, key, timeout, retry_policy)
 
     def get_setup_schema(self) -> dict:
         """Show setup info in hermes tools / hermes setup UI."""
