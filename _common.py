@@ -145,7 +145,9 @@ def is_provider_active(provider_section: str, expected_name: str) -> bool:
     Reads the YAML config each invocation (no caching) so a runtime
     change of ``tts.provider`` propagates immediately. A failing read
     returns False, which makes the hook skip — failing closed is
-    safer than injecting stale provider-specific guidance.
+    safer than injecting stale provider-specific guidance. A non-dict
+    section (for example ``tts: null``) is treated as inactive.
     """
     cfg = read_hermes_config()
-    return cfg.get(provider_section, {}).get("provider") == expected_name
+    section = cfg.get(provider_section)
+    return isinstance(section, dict) and section.get("provider") == expected_name

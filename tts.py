@@ -1,8 +1,10 @@
-"""Inworld TTS-2 (Text-to-Speech) provider for Hermes Agent.
+"""Inworld TTS provider for Hermes Agent.
 
-Supports expressive steering tags (``[say excitedly]``), non-verbal sounds
-(``[laugh]``, ``[sigh]``), emphasis via capitalization, multi-language output
-via ``{language}`` prefix, and configurable delivery modes.
+Supports two models: ``inworld-tts-2`` (instruction tags such as
+``[say excitedly]``, non-verbal sounds, emphasis via capitalization) and
+``inworld-tts-2-flash`` (non-verbal sounds only; instruction tags are
+ignored server-side). Both support multi-language output via a
+``{language}`` prefix and configurable delivery modes.
 """
 
 from __future__ import annotations
@@ -32,10 +34,36 @@ from ._common import (
     parse_retry_after_seconds,
     read_hermes_config,
 )
+from ._tts_prompts import TTS_FLASH_HOOK_CONTEXT, TTS_HOOK_CONTEXT
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_MODEL = os.environ.get("INWORLD_MODEL_ID", "inworld-tts-2")
+_PROVIDER_NAME = "inworld-tts"
+
+_MODEL_TTS2 = "inworld-tts-2"
+_MODEL_TTS2_FLASH = "inworld-tts-2-flash"
+
+DEFAULT_MODEL = _MODEL_TTS2
+
+
+def _nonblank_str(value: object) -> str | None:
+    """Return a stripped string, or ``None`` when blank or non-string."""
+    if isinstance(value, str):
+        stripped = value.strip()
+        if stripped:
+            return stripped
+    return None
+
+
+def _as_dict(value: object) -> dict[str, Any]:
+    """Return ``value`` when it is a dict, otherwise an empty dict."""
+    return value if isinstance(value, dict) else {}
+
+
+def _clean_model_id(model_id: str | None) -> str:
+    """Strip a caller/config model id; fall back on empty or non-string."""
+    return _nonblank_str(model_id) or DEFAULT_MODEL
+
 
 # Allowed values for the ``delivery_mode`` ``tts.inworld-tts`` config key.
 # Validated against this set in ``InworldTTSProvider._delivery_mode_config``.
@@ -126,6 +154,45 @@ def _extract_language(text: str) -> tuple[str, str | None]:
     if not code:
         return text, None
     return text[m.end() :].lstrip(), code
+
+
+# ── Model classification ──────────────────────────────────────────
+# Exact-ID matching is deliberate: the fallback for any future or renamed
+# model is "no prompt context" rather than a guess. Add new IDs to these
+# sets when Inworld ships them.
+_STEERING_MODEL_IDS: frozenset[str] = frozenset({_MODEL_TTS2})
+_FLASH_MODEL_IDS: frozenset[str] = frozenset({_MODEL_TTS2_FLASH})
+
+
+def _normalized_model_id(model_id: str | None) -> str:
+    return (_nonblank_str(model_id) or "").lower()
+
+
+def _supports_inworld_steering(model_id: str | None) -> bool:
+    """True only for models that accept instruction tags."""
+    return _normalized_model_id(model_id) in _STEERING_MODEL_IDS
+
+
+def _is_inworld_flash_model(model_id: str | None) -> bool:
+    """True only for the Flash model (non-verbals only)."""
+    return _normalized_model_id(model_id) in _FLASH_MODEL_IDS
+
+
+_warned_skipped_tts_context_models: set[str] = set()
+
+
+def _warn_tts_context_skipped_once(model_id: str) -> None:
+    key = _normalized_model_id(model_id)
+    if key in _warned_skipped_tts_context_models:
+        return
+    _warned_skipped_tts_context_models.add(key)
+    logger.warning(
+        "Inworld model %r is not a current TTS-2 model; skipping TTS prompt "
+        "context. Use %s or %s.",
+        model_id,
+        _MODEL_TTS2,
+        _MODEL_TTS2_FLASH,
+    )
 
 
 def _build_synthesis_payload(
@@ -227,7 +294,7 @@ class InworldTTSProvider(TTSProvider):
 
     @property
     def name(self) -> str:
-        return "inworld-tts"
+        return _PROVIDER_NAME
 
     @property
     def display_name(self) -> str:
@@ -253,16 +320,12 @@ class InworldTTSProvider(TTSProvider):
     def list_models(self) -> list[dict]:
         return [
             {
-                "id": "inworld-tts-2",
+                "id": _MODEL_TTS2,
                 "display": "Inworld Realtime TTS-2 (flagship, steering)",
             },
             {
-                "id": "inworld-tts-1.5-max",
-                "display": "Inworld TTS 1.5 Max (stable, high quality)",
-            },
-            {
-                "id": "inworld-tts-1.5-mini",
-                "display": "Inworld TTS 1.5 Mini (ultra-fast, lowest cost)",
+                "id": _MODEL_TTS2_FLASH,
+                "display": "Inworld Realtime TTS-2 Flash (fastest, lowest cost)",
             },
         ]
 
@@ -277,22 +340,38 @@ class InworldTTSProvider(TTSProvider):
         """Return the ``tts.inworld-tts`` block from Hermes config.yaml.
 
         Returns ``{}`` on any error (missing file, invalid YAML, wrong
-        type). The result is cached for the lifetime of this provider
-        instance — config files are not expected to change at runtime
-        for the per-provider section (delivery_mode, timeout, retry,
-        etc.); only the top-level ``tts.provider`` selection is
-        re-checked on every hook call via ``is_provider_active`` from
-        ``_common``.
+        type). A non-dict ``tts`` section is treated as empty. The result
+        is cached for the lifetime of this provider instance — config
+        files are not expected to change at runtime for the per-provider
+        section (delivery_mode, timeout, retry, etc.); only the top-level
+        ``tts.provider`` selection is re-checked on every hook call via
+        ``is_provider_active`` from ``_common``.
         """
         if self._HERMES_CONFIG_CACHE is not None:
             return self._HERMES_CONFIG_CACHE
         cfg = read_hermes_config()
-        tts_cfg = cfg.get("tts", {}) if cfg else {}
-        provider_cfg = tts_cfg.get("inworld-tts", {})
-        if not isinstance(provider_cfg, dict):
-            provider_cfg = {}
+        tts_cfg = _as_dict(cfg.get("tts"))
+        provider_cfg = _as_dict(tts_cfg.get(_PROVIDER_NAME))
         self._HERMES_CONFIG_CACHE = provider_cfg
         return provider_cfg
+
+    def _configured_model(self, forwarded: str | None = None) -> str:
+        """Return the effective model for this provider.
+
+        Reads ``tts.inworld-tts.model`` (alongside ``voice``) fresh so a
+        gateway-time change applies on the next first turn. Precedence:
+        the plugin-scoped ``model`` key, then the top-level ``tts.model``
+        Hermes forwards, then the ``forwarded`` argument, then
+        ``DEFAULT_MODEL``. Blank, non-string, or malformed values are
+        skipped.
+        """
+        cfg = read_hermes_config()
+        tts_cfg = _as_dict(cfg.get("tts"))
+        provider_cfg = _as_dict(tts_cfg.get(_PROVIDER_NAME))
+        model = _nonblank_str(provider_cfg.get("model")) or _nonblank_str(
+            tts_cfg.get("model")
+        )
+        return model or _clean_model_id(forwarded)
 
     def _delivery_mode_config(self) -> str:
         """Return the validated ``delivery_mode`` value.
@@ -472,7 +551,9 @@ class InworldTTSProvider(TTSProvider):
             text: Text to speak (can include steering tags like [say excitedly])
             output_path: Where to write the audio file
             voice: Voice ID from tts.inworld-tts.voice in config.yaml
-            model: Model ID (default: inworld-tts-2)
+            model: Model ID forwarded by Hermes; ``tts.inworld-tts.model``
+                wins when set, otherwise this value is used, falling back
+                to ``DEFAULT_MODEL``
             speed: Speaking rate 0.5-1.5 (default: 1.0). The field is
                 serialized inside ``audioConfig.speakingRate`` per the
                 documented Inworld v1AudioConfig schema; existing voice
@@ -488,7 +569,7 @@ class InworldTTSProvider(TTSProvider):
         """
         key = api_key()
         voice_id = voice or self._voice_config()
-        model_id = model or DEFAULT_MODEL
+        model_id = self._configured_model(model)
         delivery_mode = self._delivery_mode_config()
         timeout = self._tts_timeout_config()
         retry_policy = self._retry_policy_config()
@@ -521,7 +602,7 @@ class InworldTTSProvider(TTSProvider):
         return {
             "name": self.display_name,
             "badge": "Inworld AI",
-            "tag": "TTS-2 steering",
+            "tag": "TTS-2 voice synthesis",
             "env_vars": [
                 {
                     "key": "INWORLD_API_KEY",
@@ -534,94 +615,32 @@ class InworldTTSProvider(TTSProvider):
     # ── Hooks ────────────────────────────────────────────────────────
 
     def register_hooks(self, ctx):
-        """Register lifecycle hooks for steering context injection."""
+        """Register lifecycle hooks for TTS context injection."""
         ctx.register_hook("pre_llm_call", self._on_pre_llm_call)
 
-    def _on_pre_llm_call(self, is_first_turn, **kwargs):
-        """Inject steering instructions on the first turn only.
+    def _on_pre_llm_call(
+        self, is_first_turn: bool, **kwargs: Any
+    ) -> dict[str, str] | None:
+        """Inject model-appropriate guidance on the first turn only.
 
-        Skipped entirely when ``inworld-tts`` is not the configured TTS
-        provider — the steering guidance is specific to this provider's
-        tag syntax and would mislead the LLM when a different TTS is
-        selected. The ``is_provider_active`` helper re-reads the YAML
-        config each invocation so a gateway-time change of
-        ``tts.provider`` propagates immediately.
+        Full steering instructions are injected for ``inworld-tts-2``; the
+        Flash model gets the reduced context (non-verbals and formatting)
+        because it ignores instruction tags. Deprecated or unknown model
+        IDs get no context and a one-time warning. Skipped entirely when
+        ``inworld-tts`` is not the configured TTS provider. The
+        ``is_provider_active`` helper re-reads the YAML config each
+        invocation so a gateway-time change of ``tts.provider``
+        propagates immediately.
         """
         if not is_first_turn:
             return None
-        if not is_provider_active("tts", "inworld-tts"):
+        if not is_provider_active("tts", _PROVIDER_NAME):
             return None
 
-        return {"context": _TTS_HOOK_CONTEXT}
-
-
-# ── First-turn TTS hook context ───────────────────────────────────
-# Concatenated for byte-for-byte preservation of the original literal
-# returned from ``InworldTTSProvider._on_pre_llm_call``. Wording,
-# punctuation, and pre-existing typos are intentional.
-_TTS_HOOK_CONTEXT = (
-    "## How to Talk When Using TTS (`text_to_speech`)\n\n"
-    "When your response gets spoken aloud, drop a bracketed "
-    "steering tag at the start of the sentence it applies to.\n"
-    "Natural language only. No commas or capitals inside the brackets.\n\n"
-    "### Instruction tags\n"
-    "Use instruction tags to match your delivery to the content. The following are "
-    "suggestions; natural language instructions can be used to describe the "
-    "appropriate delivery:\n"
-    "- Emotion: [say excitedly], [sound sad], [sound concerned], [sound terrified]\n"
-    "- Articulation: [say with force], [articulate clearly], [say with deliberate pauses]\n"
-    "- Intonation: [say with a falling pitch], [say with a rising pitch]\n"
-    "- Volume: [very quiet], [very loud]\n"
-    "- Pitch: [say in a low tone], [say in a high pitch]\n"
-    "- Range: [say playfully], [say with no pitch variation]\n"
-    "- Speed: [very fast], [very slow]\n"
-    "- Vocal style: [whisper in a hushed style], [give a nasal quality]\n"
-    "- Non-verbals: [laugh], [sigh], [clear throat], [breathe], [cough], [yawn]\n"
-    "### Combining dimensions for richer direction\n"
-    "Layer mood, rhythm, pitch and mode in one tag:\n"
-    "- [say sadly with deliberate pauses in a low voice and hushed style]\n"
-    "- [say excitedly with a high pitch and fast pace]\n"
-    "- [sound concerned with a measured pace and low tone]\n"
-    "- [quietly with a warm and gentle tone]\n\n"
-    "For maximum control, combine qualities from multiple categories "
-    "in a single natural language instruction.\n"
-    "A single tag applies across multiple subsequent sentences; "
-    "repeat or change tags only when the delivery should change.\n\n"
-    "### Non-verbals (inline anywhere)\n"
-    "[laugh] [sigh] [breathe] [clear throat] [cough] [yawn]\n\n"
-    "### Emphasis via capitalization\n"
-    'Full word: "I told you NOT to do that"\n'
-    'Syllable: "AbsoLUTEly"\n'
-    "Use sparingly or it loses impact.\n\n"
-    "### Rules\n"
-    "- One steering tag per passage. Change it only when the "
-    "delivery shifts.\n"
-    "- Match the tag to the content. Don't [say sadly] on "
-    "celebratory lines.\n"
-    "- Avoid opposites in the same tag — [whisper] and [very loud] "
-    "together produce unpredictable results.\n"
-    "- Non-verbals can go inline wherever natural.\n\n"
-    "### Formatting for speech\n"
-    '- Write numbers as words: "twenty-three" not "23"\n'
-    '- Write dates as spoken: "march fifteenth"\n'
-    "- Use contractions: don't, can't, I'm, we're\n"
-    "- No markdown, no bullet points, no emoji in speech\n"
-    "- Include filler words where natural: uh, um, well, like, you know\n"
-    "- Vary sentence length for natural rhythm\n\n"
-    "### The goal\n"
-    "Don't force it. Use steering when it fits the moment — "
-    "hype when something's exciting, quiet when something matters, "
-    "[laugh] when something's funny. If it's a simple reply, "
-    "just talk. The tags are there to make the spoken delivery sound natural, "
-    "not like a robot reading a script.\n"
-    "### When to use\n"
-    "Use this steering in the input to text_to_speech tool only. "
-    "Don't use it in the normal text output to the user.\n\n"
-    "### Language override\n"
-    "To speak in a language, put the language "
-    "name in curly braces at the very start of the text. "
-    "Supported: {polish}, {spanish}, {french}, {german}, {italian}, "
-    "{portuguese}, {dutch}, {russian}, {japanese}, {chinese}, "
-    "{korean}, {arabic}, {hebrew}, {hindi}. "
-    'Example: "{polish} Witaj, świecie!" will speak Polish.\n'
-)
+        model_id = self._configured_model()
+        if _supports_inworld_steering(model_id):
+            return {"context": TTS_HOOK_CONTEXT}
+        if _is_inworld_flash_model(model_id):
+            return {"context": TTS_FLASH_HOOK_CONTEXT}
+        _warn_tts_context_skipped_once(model_id)
+        return None
