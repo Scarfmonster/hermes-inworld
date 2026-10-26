@@ -148,7 +148,10 @@ Two models are supported: `inworld/inworld-stt-1` (default) and
 `groq/whisper-large-v3`.
 
 `voice_prefix` (default `🎤`) is prepended to transcripts, except on native
-voice surfaces, where the marker is omitted by default. With
+voice surfaces, where the marker is omitted by default. On gateway platforms
+the first-turn guidance asks the model to reply with both visible text and
+the same content spoken through `text_to_speech`, so the written and spoken
+versions stay aligned. With
 `voice_profile: true`, detected characteristics are appended:
 
 ```text

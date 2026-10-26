@@ -1212,9 +1212,9 @@ class InworldSTTProvider(TranscriptionProvider):
     def register_hooks(self, ctx):
         """Register lifecycle hooks for voice-reply handling.
 
-        ``pre_llm_call`` injects first-turn guidance (the marker and
-        ``text_to_speech`` instruction plus the optional Voice Profile
-        glossary). ``pre_transcription`` records the STT source so
+        ``pre_llm_call`` injects first-turn guidance (the marker and the
+        text-plus-``text_to_speech`` instruction plus the optional Voice
+        Profile glossary). ``pre_transcription`` records the STT source so
         ``transcribe`` can omit the marker on native voice surfaces.
 
         No tool-interception hook is registered: ``text_to_speech``
@@ -1304,8 +1304,15 @@ class InworldSTTProvider(TranscriptionProvider):
                 parts.append(
                     f"When a user message starts with **{prefix}** it means they "
                     "sent a voice recording that was transcribed to text. "
-                    "Reply with `text_to_speech` so the conversation stays "
-                    "in voice mode."
+                    "Reply with both text and speech: write the complete "
+                    "response as visible text, then call `text_to_speech` to "
+                    "speak that same response. Keep the two versions "
+                    "essentially identical — compose the text you intend to "
+                    "speak rather than a summary of it, so what is displayed "
+                    "matches what is heard. When the response includes "
+                    "visual content (tables, code, charts, images), have the "
+                    "speech describe the same content instead of adding a "
+                    "different answer."
                 )
 
             if vp_enabled:
