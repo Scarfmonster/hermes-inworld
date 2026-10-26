@@ -675,7 +675,7 @@ class InworldTTSProvider(TTSProvider):
             return _TTS_HTTP_TIMEOUT_SECONDS
         try:
             value = int(raw)
-        except (TypeError, ValueError):
+        except TypeError, ValueError:
             return _TTS_HTTP_TIMEOUT_SECONDS
         if value < 1:
             return 1
@@ -707,12 +707,12 @@ class InworldTTSProvider(TTSProvider):
             elif isinstance(default, int):
                 try:
                     policy[key] = max(0, int(raw))
-                except (TypeError, ValueError):
+                except TypeError, ValueError:
                     policy[key] = default
             else:
                 try:
                     policy[key] = max(0.0, float(raw))
-                except (TypeError, ValueError):
+                except TypeError, ValueError:
                     policy[key] = default
         return policy
 

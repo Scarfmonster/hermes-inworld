@@ -93,7 +93,7 @@ def _parse_retry_after_value(raw: Any) -> float | None:
     """Parse an integer-seconds or HTTP-date ``Retry-After`` value."""
     try:
         return max(0.0, float(raw))
-    except (TypeError, ValueError):
+    except TypeError, ValueError:
         pass
     try:
         target = parsedate_to_datetime(raw)
@@ -103,7 +103,7 @@ def _parse_retry_after_value(raw: Any) -> float | None:
             target = target.replace(tzinfo=timezone.utc)
         delta = (target - datetime.now(tz=timezone.utc)).total_seconds()
         return max(0.0, delta)
-    except (TypeError, ValueError):
+    except TypeError, ValueError:
         return None
 
 

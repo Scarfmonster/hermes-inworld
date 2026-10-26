@@ -48,6 +48,11 @@ stt:
   provider: inworld-stt
   inworld-stt:
     voice_prefix: "🎤"        # set "" to disable
+    voice_reply:              # native voice surfaces own reply playback
+      platforms: ["desktop", "tui", "cli"]
+      sources: ["voice_mode"]
+      suppress_voice_prefix: true
+      suppress_reply_prompt: true
     voice_profile: false      # append voice characteristics to transcripts
     voice_profile_skip_keys: ["age", "gender", "accent"]
     voice_profile_min_confidence: 0.2
@@ -142,7 +147,8 @@ can pin a different streamer; under `auto`, built-in streamers are tried first.
 Two models are supported: `inworld/inworld-stt-1` (default) and
 `groq/whisper-large-v3`.
 
-`voice_prefix` (default `🎤`) is prepended to every transcript. With
+`voice_prefix` (default `🎤`) is prepended to transcripts, except on native
+voice surfaces, where the marker is omitted by default. With
 `voice_profile: true`, detected characteristics are appended:
 
 ```text

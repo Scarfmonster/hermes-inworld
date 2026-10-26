@@ -17,6 +17,8 @@ import tempfile
 import time
 import urllib.error
 import urllib.request
+from contextvars import ContextVar
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, TypedDict, cast
 
@@ -89,6 +91,65 @@ _VOICE_PROFILE_SKIP_KEYS = frozenset({"age", "gender", "accent"})
 # detections. Configurable via ``stt.inworld-stt.voice_profile_min_confidence``.
 _VOICE_PROFILE_MIN_CONFIDENCE = 0.2
 
+# Native voice surfaces that synthesize assistant replies themselves.
+# On these platforms the plugin does not instruct the model to call
+# ``text_to_speech`` unless the user explicitly asks for audio.
+# Configurable via ``stt.inworld-stt.voice_reply.platforms``.
+_DEFAULT_VOICE_REPLY_PLATFORMS = frozenset({"desktop", "tui", "cli"})
+
+# STT sources that belong to a native voice surface. Recordings from these
+# sources omit the ``voice_prefix`` marker because the surrounding client
+# already presents the turn as voice. Configurable via
+# ``stt.inworld-stt.voice_reply.sources``.
+_DEFAULT_VOICE_REPLY_SOURCES = frozenset({"voice_mode"})
+
+# Transcription source reported by the host for the current dispatch.
+# ``pre_transcription`` runs synchronously before the provider call, so a
+# value set there is visible here and to every chunk dispatched by
+# ``transcribe_oversized()``.
+_current_transcription_source: ContextVar[str | None] = ContextVar(
+    "inworld_stt_source", default=None
+)
+
+
+@dataclass(frozen=True)
+class _VoiceReplyConfig:
+    """Resolved ``voice_reply`` policy for native voice surfaces.
+
+    Attributes:
+        platforms: Lower-cased platform names whose replies are spoken by
+            the client, so the model needs no ``text_to_speech`` guidance.
+        sources: Lower-cased STT sources whose transcripts omit the
+            ``voice_prefix`` marker.
+        suppress_voice_prefix: Whether ``sources`` transcripts omit the
+            marker.
+        suppress_reply_prompt: Whether ``platforms`` first turns skip the
+            ``text_to_speech`` instruction.
+    """
+
+    platforms: frozenset[str] = _DEFAULT_VOICE_REPLY_PLATFORMS
+    sources: frozenset[str] = _DEFAULT_VOICE_REPLY_SOURCES
+    suppress_voice_prefix: bool = True
+    suppress_reply_prompt: bool = True
+
+    def omits_prefix_for(self, source: str | None) -> bool:
+        """Return whether ``source`` transcripts omit the voice prefix."""
+        return self.suppress_voice_prefix and bool(source) and source in self.sources
+
+    def skips_reply_prompt_for(self, platform: str) -> bool:
+        """Return whether ``platform`` first turns skip the TTS instruction."""
+        return self.suppress_reply_prompt and platform in self.platforms
+
+
+_VOICE_REPLY_DEFAULTS = _VoiceReplyConfig()
+_VOICE_REPLY_DISABLED = _VoiceReplyConfig(
+    platforms=frozenset(),
+    sources=frozenset(),
+    suppress_voice_prefix=False,
+    suppress_reply_prompt=False,
+)
+
+
 # Reference glossary for the Voice Profile suffix injected into the LLM
 # prompt. Each top-level key is a Voice Profile category returned at the
 # response root (``voiceProfile.<category>``); the inner mapping gives
@@ -154,6 +215,76 @@ _STT_HTTP_TIMEOUT_SECONDS = 120
 
 
 # ── Helpers ─────────────────────────────────────────────────────────
+
+
+def _normalize_voice_reply_set(
+    raw: Any,
+    default: frozenset[str],
+) -> frozenset[str]:
+    """Normalize a ``voice_reply`` list value to a lower-cased set.
+
+    Accepts a list of strings or a single string (treated as a
+    one-element list). Blanks are dropped, so ``[]`` yields the empty
+    set (suppression disabled for that axis) while missing/``null``/other
+    non-list values fall back to ``default``.
+    """
+    if isinstance(raw, str):
+        values: list[Any] = [raw]
+    elif isinstance(raw, list):
+        values = raw
+    else:
+        return default
+    normalized = {str(value).strip().lower() for value in values}
+    normalized.discard("")
+    return frozenset(normalized)
+
+
+def _voice_reply_flag(raw: Any, default: bool) -> bool:
+    """Return a boolean ``voice_reply`` toggle, falling back to ``default``.
+
+    Only real booleans are honored; malformed values (``null``, numbers,
+    strings) keep the default so a typo cannot silently flip behavior.
+    """
+    return raw if isinstance(raw, bool) else default
+
+
+def _parse_voice_reply_config(raw: Any) -> _VoiceReplyConfig:
+    """Parse the ``voice_reply`` config block into a resolved policy.
+
+    Behavior:
+
+    - missing, ``null``, or ``true``: use the defaults;
+    - literal ``false`` or ``{enabled: false}``: disable all handling;
+    - any other non-dict value (for example the string ``"false"``):
+      use the defaults;
+    - a dict: normalize ``platforms``/``sources`` and read the two
+      suppression toggles, each falling back to its default.
+
+    Never raises; always returns a fully populated
+    :class:`_VoiceReplyConfig`.
+    """
+    if raw is False:
+        return _VOICE_REPLY_DISABLED
+    if isinstance(raw, dict):
+        if raw.get("enabled") is False:
+            return _VOICE_REPLY_DISABLED
+        return _VoiceReplyConfig(
+            platforms=_normalize_voice_reply_set(
+                raw.get("platforms"), _DEFAULT_VOICE_REPLY_PLATFORMS
+            ),
+            sources=_normalize_voice_reply_set(
+                raw.get("sources"), _DEFAULT_VOICE_REPLY_SOURCES
+            ),
+            suppress_voice_prefix=_voice_reply_flag(
+                raw.get("suppress_voice_prefix"),
+                _VOICE_REPLY_DEFAULTS.suppress_voice_prefix,
+            ),
+            suppress_reply_prompt=_voice_reply_flag(
+                raw.get("suppress_reply_prompt"),
+                _VOICE_REPLY_DEFAULTS.suppress_reply_prompt,
+            ),
+        )
+    return _VOICE_REPLY_DEFAULTS
 
 
 def _detect_format(file_path: str) -> str:
@@ -282,7 +413,7 @@ def _probe_with_ffprobe(
                         initial_probe["encoding"] = "FLAC"
                     break
             return initial_probe
-    except (FileNotFoundError, subprocess.TimeoutExpired, json.JSONDecodeError):
+    except FileNotFoundError, subprocess.TimeoutExpired, json.JSONDecodeError:
         pass
     return None
 
@@ -298,7 +429,7 @@ def _probe_wav_header(file_path: str, initial_probe: _ProbeResult) -> None:
             initial_probe["channels"] = channels
             initial_probe["sample_rate"] = sample_rate
             initial_probe["encoding"] = "LINEAR16"
-    except (OSError, struct.error):
+    except OSError, struct.error:
         pass
 
 
@@ -370,6 +501,7 @@ class InworldSTTProvider(TranscriptionProvider):
         }
 
     _HERMES_CONFIG_CACHE: dict[str, Any] | None = None
+    _VOICE_REPLY_CONFIG_CACHE: _VoiceReplyConfig | None = None
 
     def _get_provider_config(self) -> dict[str, Any]:
         """Read the per-provider config from Hermes config.yaml.
@@ -431,6 +563,46 @@ class InworldSTTProvider(TranscriptionProvider):
             return ""
         return prefix.strip()
 
+    def _voice_reply_config(self) -> _VoiceReplyConfig:
+        """Return the resolved native-voice reply policy.
+
+        On native voice surfaces the client owns voice output, so the
+        plugin can omit both the ``🎤`` marker and the first-turn
+        ``text_to_speech`` instruction. Expects YAML like::
+
+            stt:
+              inworld-stt:
+                voice_reply:
+                  platforms: ["desktop", "tui", "cli"]
+                  sources: ["voice_mode"]
+                  suppress_voice_prefix: true
+                  suppress_reply_prompt: true
+
+        Missing/``null``/``true`` use the defaults; ``false`` or
+        ``{enabled: false}`` disables all handling. The parsed policy is
+        memoized for the lifetime of this provider instance so chunked
+        transcription does not re-normalize the lists per segment.
+        """
+        cached = self._VOICE_REPLY_CONFIG_CACHE
+        if cached is not None:
+            return cached
+        cfg = self._get_provider_config()
+        voice_reply = _parse_voice_reply_config(cfg.get("voice_reply"))
+        self._VOICE_REPLY_CONFIG_CACHE = voice_reply
+        if voice_reply.suppress_voice_prefix and not voice_reply.sources:
+            logger.warning(
+                "voice_reply.suppress_voice_prefix is enabled but "
+                "voice_reply.sources is empty — no transcript will omit "
+                "the voice prefix."
+            )
+        if voice_reply.suppress_reply_prompt and not voice_reply.platforms:
+            logger.warning(
+                "voice_reply.suppress_reply_prompt is enabled but "
+                "voice_reply.platforms is empty — no platform will skip "
+                "the text_to_speech instruction."
+            )
+        return voice_reply
+
     def _get_voice_profile_config(self) -> bool:
         """Return whether Voice Profile analysis is enabled.
 
@@ -477,7 +649,7 @@ class InworldSTTProvider(TranscriptionProvider):
             return _VOICE_PROFILE_MIN_CONFIDENCE
         try:
             value = float(raw)
-        except (TypeError, ValueError):
+        except TypeError, ValueError:
             return _VOICE_PROFILE_MIN_CONFIDENCE
         if not 0.0 <= value <= 1.0:
             return _VOICE_PROFILE_MIN_CONFIDENCE
@@ -527,7 +699,7 @@ class InworldSTTProvider(TranscriptionProvider):
             return _STT_HTTP_TIMEOUT_SECONDS
         try:
             value = int(raw)
-        except (TypeError, ValueError):
+        except TypeError, ValueError:
             return _STT_HTTP_TIMEOUT_SECONDS
         if value < 1:
             return 1
@@ -546,7 +718,7 @@ class InworldSTTProvider(TranscriptionProvider):
             return _FFMPEG_CONVERSION_TIMEOUT_SECONDS
         try:
             value = int(raw)
-        except (TypeError, ValueError):
+        except TypeError, ValueError:
             return _FFMPEG_CONVERSION_TIMEOUT_SECONDS
         if value < 1:
             return 1
@@ -565,7 +737,7 @@ class InworldSTTProvider(TranscriptionProvider):
             return _FFPROBE_TIMEOUT_SECONDS
         try:
             value = int(raw)
-        except (TypeError, ValueError):
+        except TypeError, ValueError:
             return _FFPROBE_TIMEOUT_SECONDS
         if value < 1:
             return 1
@@ -596,12 +768,12 @@ class InworldSTTProvider(TranscriptionProvider):
             elif isinstance(default, int):
                 try:
                     policy[key] = max(0, int(raw))
-                except (TypeError, ValueError):
+                except TypeError, ValueError:
                     policy[key] = default
             else:
                 try:
                     policy[key] = max(0.0, float(raw))
-                except (TypeError, ValueError):
+                except TypeError, ValueError:
                     policy[key] = default
         return policy
 
@@ -678,6 +850,16 @@ class InworldSTTProvider(TranscriptionProvider):
         """
         model_id = model or DEFAULT_MODEL
         lang = language or DEFAULT_LANGUAGE
+
+        # Native voice surfaces already present the turn as voice, so the
+        # marker is omitted for their STT sources. Computed once per call:
+        # chunked transcription dispatches every segment through this
+        # method with the same context value.
+        voice_reply = self._voice_reply_config()
+        source = _current_transcription_source.get()
+        suppress_prefix = voice_reply.omits_prefix_for(source)
+        if suppress_prefix:
+            logger.debug("Omitting voice prefix for native voice source '%s'", source)
 
         # Validate the audio file exists
         audio_path = Path(file_path)
@@ -779,6 +961,7 @@ class InworldSTTProvider(TranscriptionProvider):
                 data,
                 include_voice_profile=not fell_back_to_auto_detect,
                 empty_error="Empty transcript returned by API",
+                include_voice_prefix=not suppress_prefix,
             )
         finally:
             if needs_cleanup:
@@ -984,20 +1167,25 @@ class InworldSTTProvider(TranscriptionProvider):
         data: dict[str, Any],
         include_voice_profile: bool,
         empty_error: str,
+        include_voice_prefix: bool = True,
     ) -> dict[str, Any]:
-        """Build the success-side envelope, optionally appending the
-        Voice Profile suffix.
+        """Build the success-side envelope with optional transcript decorations.
+
+        ``include_voice_prefix`` prepends the configured marker; callers
+        pass ``False`` for native voice sources whose client already
+        presents the turn as voice. ``include_voice_profile`` appends the
+        Voice Profile suffix; the retry path passes ``False`` after the
+        AUTO_DETECT fallback to deliberately omit it. The two flags are
+        independent.
 
         ``voiceProfile`` lives at the top level of the documented
         Inworld response (sibling of ``transcription`` and ``usage``).
-        The retry path passes ``include_voice_profile=False`` to
-        deliberately omit the suffix.
         """
         transcription = data.get("transcription", {})
         transcript: str = transcription.get("transcript", "")
 
-        # Prepend voice marker if configured
-        voice_prefix = self._get_voice_prefix_config()
+        # Prepend voice marker if configured and not suppressed
+        voice_prefix = self._get_voice_prefix_config() if include_voice_prefix else ""
         if voice_prefix and transcript:
             transcript = f"{voice_prefix} {transcript}"
 
@@ -1022,11 +1210,61 @@ class InworldSTTProvider(TranscriptionProvider):
     # ── Hooks ────────────────────────────────────────────────────
 
     def register_hooks(self, ctx):
-        """Register lifecycle hooks for voice prefix context injection."""
-        ctx.register_hook("pre_llm_call", self._on_pre_llm_call)
+        """Register lifecycle hooks for voice-reply handling.
 
-    def _on_pre_llm_call(self, is_first_turn, **kwargs):
-        """Inject voice prefix instructions on the first turn only.
+        ``pre_llm_call`` injects first-turn guidance (the marker and
+        ``text_to_speech`` instruction plus the optional Voice Profile
+        glossary). ``pre_transcription`` records the STT source so
+        ``transcribe`` can omit the marker on native voice surfaces.
+
+        No tool-interception hook is registered: ``text_to_speech``
+        remains available on every platform so explicit audio requests
+        keep working.
+        """
+        ctx.register_hook("pre_llm_call", self._on_pre_llm_call)
+        ctx.register_hook("pre_transcription", self._on_pre_transcription)
+
+    def _on_pre_transcription(
+        self,
+        file_path: str,
+        provider: str,
+        source: str | None = None,
+        **kwargs: Any,
+    ) -> None:
+        """Record the STT source for the dispatch already in flight.
+
+        The host fires this hook synchronously on the caller thread
+        before the provider runs, so the value is visible to
+        ``transcribe()`` for the original file, any re-encoded file, and
+        every segment dispatched by ``transcribe_oversized()``. It is
+        deliberately not cleared by ``transcribe()``; the next
+        invocation overwrites it.
+
+        The source is recorded only when ``provider`` is this provider.
+        A dispatch for another provider clears any value left in the
+        same context. Non-string or blank sources also clear it. The
+        callback never raises and returns ``None`` so the STT prompt,
+        language, and model stay untouched.
+        """
+        try:
+            normalized: str | None = None
+            if (
+                isinstance(provider, str)
+                and provider.strip().lower() == self.name
+                and isinstance(source, str)
+                and source.strip()
+            ):
+                normalized = source.strip().lower()
+            _current_transcription_source.set(normalized)
+        except Exception:
+            logger.debug("pre_transcription hook failed", exc_info=True)
+            _current_transcription_source.set(None)
+        return None
+
+    def _on_pre_llm_call(
+        self, is_first_turn: bool, **kwargs: Any
+    ) -> dict[str, Any] | None:
+        """Inject first-turn voice guidance for the active provider.
 
         Skipped entirely when ``inworld-stt`` is not the configured STT
         provider — both the voice marker and Voice Profile suffix are
@@ -1035,45 +1273,68 @@ class InworldSTTProvider(TranscriptionProvider):
         ``is_provider_active`` helper re-reads the YAML config each
         invocation so a gateway-time change of ``stt.provider``
         propagates immediately.
+
+        Native voice platforms (``voice_reply.platforms``) omit the
+        ``text_to_speech`` instruction because their client speaks the
+        reply itself. Gateway platforms keep it so voice notes keep
+        replying in voice. The Voice Profile glossary is injected
+        whenever ``voice_profile`` is enabled.
         """
-        if not is_first_turn:
-            return None
-        if not is_provider_active("stt", "inworld-stt"):
-            return None
+        try:
+            if not is_first_turn:
+                return None
+            if not is_provider_active("stt", "inworld-stt"):
+                return None
 
-        prefix = self._get_voice_prefix_config()
-        vp_enabled = self._get_voice_profile_config()
+            prefix = self._get_voice_prefix_config()
+            vp_enabled = self._get_voice_profile_config()
 
-        if not prefix and not vp_enabled:
-            return None
+            if not prefix and not vp_enabled:
+                return None
 
-        parts: list[str] = []
-
-        if prefix:
-            parts.append(
-                f"When a user message starts with **{prefix}** it means they "
-                "sent a voice recording that was transcribed to text. "
-                "Reply with `text_to_speech` so the conversation stays "
-                "in voice mode."
+            voice_reply = self._voice_reply_config()
+            platform = str(kwargs.get("platform") or "").strip().lower()
+            teach_marker = bool(prefix) and not voice_reply.skips_reply_prompt_for(
+                platform
             )
 
-        if vp_enabled:
-            vp_intro = (
-                "A suffix in square brackets like "
-                "`[emotion -> calm:0.85 | vocalStyle -> normal:0.92]` "
-                "describes the speaker's detected voice characteristics "
-                "with confidence scores (0.00-1.00).\n"
-                "**Interpreting confidence scores** — each label is "
-                "paired with a score between 0.00 and 1.00. Use these "
-                "thresholds when deciding how strongly to weight a "
-                "detection.\n"
-                "A very low score might be a false positive; in such cases, "
-                "always match the detected characteristic with the "
-                "content of the transcription to verify."
-            )
-            glossary = self._voice_profile_glossary()
-            parts.append(f"{vp_intro}\n\n{glossary}" if glossary else vp_intro)
+            parts: list[str] = []
 
-        return {
-            "context": ("## Voice Transcription Markers\n\n" + "\n\n".join(parts)),
-        }
+            if teach_marker:
+                parts.append(
+                    f"When a user message starts with **{prefix}** it means they "
+                    "sent a voice recording that was transcribed to text. "
+                    "Reply with `text_to_speech` so the conversation stays "
+                    "in voice mode."
+                )
+
+            if vp_enabled:
+                vp_intro = (
+                    "A suffix in square brackets like "
+                    "`[emotion -> calm:0.85 | vocalStyle -> normal:0.92]` "
+                    "describes the speaker's detected voice characteristics "
+                    "with confidence scores (0.00-1.00).\n"
+                    "**Interpreting confidence scores** — each label is "
+                    "paired with a score between 0.00 and 1.00. Use these "
+                    "thresholds when deciding how strongly to weight a "
+                    "detection.\n"
+                    "A very low score might be a false positive; in such cases, "
+                    "always match the detected characteristic with the "
+                    "content of the transcription to verify."
+                )
+                glossary = self._voice_profile_glossary()
+                parts.append(f"{vp_intro}\n\n{glossary}" if glossary else vp_intro)
+
+            if not parts:
+                return None
+
+            # Only label the context as marker guidance when the marker
+            # instruction is actually present; a glossary-only context
+            # uses its own heading.
+            heading = (
+                "## Voice Transcription Markers" if teach_marker else "## Voice Profile"
+            )
+            return {"context": heading + "\n\n" + "\n\n".join(parts)}
+        except Exception:
+            logger.debug("pre_llm_call hook failed", exc_info=True)
+            return None
