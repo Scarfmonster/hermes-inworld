@@ -3,7 +3,7 @@ name = "hermes-inworld"
 version = "1.4.0"
 description = "Hermes Agent plugin providing Inworld TTS-2 (steered speech synthesis) and Realtime STT (transcription with Voice Profile analysis)."
 readme = "README.md"
-requires-python = ">=3.13"
+requires-python = ">=3.14"
 dependencies = [
     "ruamel-yaml>=0.18.16",
 ]
@@ -16,3 +16,8 @@ dev = [
 
 [tool.uv.sources]
 hermes-agent = { git = "https://github.com/NousResearch/hermes-agent.git" }
+
+[tool.uv]
+override-dependencies = [
+    "Pillow==13.0.0",
+]
